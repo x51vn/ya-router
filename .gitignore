@@ -37,3 +37,7 @@ context_portal/context.db
 context_portal/logs/*.log
 context_portal/**/__pycache__/
 context_portal/**/*.pyc
+
+# Local agent/session state (do not commit)
+.omo/
+.serena/
