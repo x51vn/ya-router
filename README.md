@@ -33,7 +33,7 @@ Vietnamese operator guide: `docs/HUONG_DAN_SU_DUNG.md`
 make build
 
 # or
-go build -o github-copilot-svcs ./src
+go build -o github-copilot-svcs ./cmd/github-copilot-svcs
 ```
 
 ### 2. Prepare Runtime Config

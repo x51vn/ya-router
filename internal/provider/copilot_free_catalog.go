@@ -1,4 +1,4 @@
-package main
+package provider
 
 import (
 	"context"
@@ -10,12 +10,15 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/x51vn/github-copilot-svcs/internal/config"
+	"github.com/x51vn/github-copilot-svcs/internal/httputil"
+	"github.com/x51vn/github-copilot-svcs/internal/types"
 )
 
 var (
@@ -59,7 +62,7 @@ func NewCopilotFreeCatalog(ttl time.Duration) *CopilotFreeCatalog {
 	if ttl <= 0 {
 		ttl = defaultFreeCatalogTTL
 	}
-	cachePath, err := getRuntimeStatePath(copilotFreeCatalogCacheFile)
+	cachePath, err := config.GetRuntimeStatePath(copilotFreeCatalogCacheFile)
 	if err != nil {
 		log.Printf("copilot free catalog: state path unavailable: %v", err)
 	}
@@ -167,8 +170,8 @@ func (c *CopilotFreeCatalog) httpClient() *http.Client {
 	if c.client != nil {
 		return c.client
 	}
-	if sharedHTTPClient != nil {
-		return sharedHTTPClient
+	if httputil.SharedHTTPClient != nil {
+		return httputil.SharedHTTPClient
 	}
 	return &http.Client{Timeout: 30 * time.Second}
 }
@@ -219,14 +222,6 @@ func cloneCatalogSnapshot(snapshot *copilotFreeCatalogSnapshot) *copilotFreeCata
 	clone.ZeroPremiumModels = append([]string(nil), snapshot.ZeroPremiumModels...)
 	clone.EligibleModels = append([]string(nil), snapshot.EligibleModels...)
 	return &clone
-}
-
-func getRuntimeStatePath(fileName string) (string, error) {
-	configPath, err := getConfigPath()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(filepath.Dir(configPath), fileName), nil
 }
 
 func parseCopilotPlanFreeModels(pageHTML string) ([]string, error) {
@@ -318,12 +313,12 @@ func intersectNormalizedModelNames(left, right []string) []string {
 	return out
 }
 
-func resolveEffectiveCopilotFreeModels(docEligible []string, upstream *ModelList) []Model {
+func resolveEffectiveCopilotFreeModels(docEligible []string, upstream *types.ModelList) []types.Model {
 	if upstream == nil {
 		return nil
 	}
 
-	var resolved []Model
+	var resolved []types.Model
 	used := make(map[string]bool)
 
 	for _, target := range docEligible {
@@ -349,7 +344,7 @@ func resolveEffectiveCopilotFreeModels(docEligible []string, upstream *ModelList
 	return resolved
 }
 
-func scoreModelCandidate(target string, model Model) int {
+func scoreModelCandidate(target string, model types.Model) int {
 	score := -1
 	for _, candidate := range modelCandidateKeys(model) {
 		switch {
@@ -371,7 +366,7 @@ func scoreModelCandidate(target string, model Model) int {
 	return score
 }
 
-func modelCandidateKeys(model Model) []string {
+func modelCandidateKeys(model types.Model) []string {
 	candidates := []string{
 		normalizeModelName(model.Name),
 		normalizeModelName(model.ID),
@@ -502,13 +497,13 @@ func sortUniqueStrings(items []string) []string {
 	return items
 }
 
-func cloneModelList(ml *ModelList) *ModelList {
+func cloneModelList(ml *types.ModelList) *types.ModelList {
 	if ml == nil {
 		return nil
 	}
-	clone := &ModelList{
+	clone := &types.ModelList{
 		Object: ml.Object,
-		Data:   append([]Model(nil), ml.Data...),
+		Data:   append([]types.Model(nil), ml.Data...),
 	}
 	return clone
 }

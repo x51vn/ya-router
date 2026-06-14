@@ -1,11 +1,13 @@
 // Package main provides the GitHub Copilot proxy service.
 // provider.go defines the Provider interface and shared types.
-package main
+package provider
 
 import (
 	"context"
 	"net/http"
 	"time"
+
+	"github.com/x51vn/github-copilot-svcs/internal/types"
 )
 
 // ProviderID is the machine-readable identifier for a backend provider.
@@ -53,7 +55,7 @@ type Provider interface {
 
 	// ListModels returns the filtered list of models for this provider.
 	// Implementations must apply provider-specific allowed_models filtering.
-	ListModels(ctx context.Context) (*ModelList, error)
+	ListModels(ctx context.Context) (*types.ModelList, error)
 
 	// ProxyRequest executes a proxied request for the given capability
 	// and writes the full response to w.  body is the request payload

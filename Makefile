@@ -4,7 +4,7 @@ VERSION ?= $(shell date +%Y%m%d)-local
 all: build
 
 build:
-	go build -ldflags="-s -w -X main.version=$(VERSION)" -o $(BINARY) ./src
+	go build -ldflags="-s -w -X main.version=$(VERSION)" -o $(BINARY) ./cmd/github-copilot-svcs
 
 run: build
 	./$(BINARY) run
@@ -42,16 +42,16 @@ release: build docker-build docker-push git-commit-push
 
 .PHONY: fmt vet tidy test help docker-build docker-push git-commit-push release
 fmt:
-	go fmt ./src/...
+	go fmt ./internal/... ./cmd/... ./src/...
 
 vet:
-	go vet ./src/...
+	go vet ./internal/... ./cmd/... ./src/...
 
 tidy:
 	go mod tidy
 
 test:
-	go test ./src/...
+	go test ./internal/... ./cmd/... ./src/...
 
 help:
 	@echo "Targets: build run auth models config clean fmt vet tidy test docker-build docker-push release"

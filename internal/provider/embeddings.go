@@ -1,4 +1,4 @@
-package main
+package provider
 
 import (
 	"bytes"
@@ -23,12 +23,10 @@ func normalizeEmbeddingsRequestBody(body []byte) (normalized []byte, model strin
 	if input, ok := payload["input"]; ok {
 		switch v := input.(type) {
 		case string:
-			// Copilot /embeddings rejects string input; it accepts array input.
 			payload["input"] = []any{v}
 		case []any:
-			// Already in the accepted shape.
 		default:
-			// Leave other shapes as-is.
+			_ = v
 		}
 	}
 

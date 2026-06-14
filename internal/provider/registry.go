@@ -1,5 +1,5 @@
 // registry.go — ProviderRegistry holds and dispatches to all configured providers.
-package main
+package provider
 
 import (
 	"fmt"

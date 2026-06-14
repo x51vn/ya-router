@@ -1,56 +1,5 @@
-// transform.go — request body parsing and model-field utilities.
-package main
-
-import (
-	"encoding/json"
-	"log"
-	"strings"
-)
-
-// extractModelFromBody parses the "model" field from a JSON request body.
-// Returns "" if the field is absent or the body cannot be parsed.
-func extractModelFromBody(body []byte) string {
-	var req struct {
-		Model string `json:"model"`
-	}
-	if err := json.Unmarshal(body, &req); err != nil {
-		return ""
-	}
-	return req.Model
-}
-
-// patchBodyModel returns body with the top-level "model" field set to model.
-// On any parse error the original body is returned unchanged.
-func patchBodyModel(body []byte, model string) []byte {
-	var m map[string]interface{}
-	if err := json.Unmarshal(body, &m); err != nil {
-		log.Printf("patchBodyModel: cannot unmarshal body: %v", err)
-		return body
-	}
-	m["model"] = model
-	patched, err := json.Marshal(m)
-	if err != nil {
-		log.Printf("patchBodyModel: cannot re-marshal body: %v", err)
-		return body
-	}
-	return patched
-}
-
-// isModelAllowed reports whether model appears in the allowed list.
-// An empty list means "allow everything".
-func isModelAllowed(model string, allowedModels []string) bool {
-	if len(allowedModels) == 0 {
-		return true
-	}
-	for _, allowed := range allowedModels {
-		if strings.EqualFold(model, allowed) {
-			return true
-		}
-	}
-	return false
-}
-
-// OpenAI-compatible request/response structures shared across the package.
+// types.go — shared OpenAI-compatible request/response structures.
+package types
 
 // ChatCompletionRequest is the standard OpenAI chat completions payload.
 type ChatCompletionRequest struct {

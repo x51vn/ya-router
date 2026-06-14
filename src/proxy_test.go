@@ -352,7 +352,7 @@ func TestProcessProxyRequest_ResponsesStripsReasoningForNonCodexFallback(t *test
 
 func TestCopilotProvider_ProxyFreeChatRequest_RotatesAndIgnoresClientModel(t *testing.T) {
 	provider := NewCopilotProvider(defaultConfig())
-	provider.freeModelResolver = func(context.Context) ([]Model, error) {
+	provider.FreeModelResolver = func(context.Context) ([]Model, error) {
 		return []Model{
 			{ID: "gpt-4.1", Name: "GPT-4.1"},
 			{ID: "gpt-4o", Name: "GPT-4o"},
@@ -360,7 +360,7 @@ func TestCopilotProvider_ProxyFreeChatRequest_RotatesAndIgnoresClientModel(t *te
 	}
 
 	var attempted []string
-	provider.proxyExecutor = func(_ context.Context, _ *http.Request, body []byte, _ Capability) (*http.Response, string, error) {
+	provider.ProxyExecutor = func(_ context.Context, _ *http.Request, body []byte, _ Capability) (*http.Response, string, error) {
 		attempted = append(attempted, extractModelFromBody(body))
 		resp := &http.Response{
 			StatusCode: http.StatusOK,
@@ -392,7 +392,7 @@ func TestCopilotProvider_ProxyFreeChatRequest_RotatesAndIgnoresClientModel(t *te
 
 func TestCopilotProvider_ProxyFreeChatRequest_ShiftsOnFailure(t *testing.T) {
 	provider := NewCopilotProvider(defaultConfig())
-	provider.freeModelResolver = func(context.Context) ([]Model, error) {
+	provider.FreeModelResolver = func(context.Context) ([]Model, error) {
 		return []Model{
 			{ID: "gpt-4.1", Name: "GPT-4.1"},
 			{ID: "gpt-4o", Name: "GPT-4o"},
@@ -401,7 +401,7 @@ func TestCopilotProvider_ProxyFreeChatRequest_ShiftsOnFailure(t *testing.T) {
 	}
 
 	var attempted []string
-	provider.proxyExecutor = func(_ context.Context, _ *http.Request, body []byte, _ Capability) (*http.Response, string, error) {
+	provider.ProxyExecutor = func(_ context.Context, _ *http.Request, body []byte, _ Capability) (*http.Response, string, error) {
 		modelID := extractModelFromBody(body)
 		attempted = append(attempted, modelID)
 		resp := &http.Response{
@@ -444,7 +444,7 @@ func TestCopilotProvider_ProxyFreeChatRequest_ShiftsOnFailure(t *testing.T) {
 // the same non-nil result.
 func TestCoalesceRequest_ConcurrentWaitersReceiveSameResult(t *testing.T) {
 	cc := NewCoalescingCache()
-	key := cc.getRequestKey("GET", "/v1/models", nil)
+	key := cc.GetRequestKey("GET", "/v1/models", nil)
 
 	expected := &ModelList{
 		Object: "list",
@@ -842,30 +842,30 @@ func TestModelsHandler_ConcurrentRequests(t *testing.T) {
 
 // TestCircuitBreaker_OpenClosedTransition tests the circuit breaker states.
 func TestCircuitBreaker_OpenClosedTransition(t *testing.T) {
-	cb := &CircuitBreaker{state: CircuitClosed, timeout: 100 * time.Millisecond}
+	cb := newCircuitBreakerWithState(CircuitClosed, 100*time.Millisecond)
 
 	// Should start closed
-	if !cb.canExecute() {
+	if !cb.CanExecute() {
 		t.Fatal("circuit breaker should allow execution when closed")
 	}
 
 	// Trigger failures to open the circuit
-	for i := 0; i < circuitBreakerFailureThreshold; i++ {
-		cb.onFailure()
+	for i := 0; i < CircuitBreakerFailureThreshold; i++ {
+		cb.OnFailure()
 	}
-	if cb.canExecute() {
+	if cb.CanExecute() {
 		t.Fatal("circuit breaker should be open after threshold failures")
 	}
 
 	// Wait for timeout to transition to half-open
 	time.Sleep(150 * time.Millisecond)
-	if !cb.canExecute() {
+	if !cb.CanExecute() {
 		t.Fatal("circuit breaker should allow execution after timeout (half-open)")
 	}
 
 	// Success should close it
-	cb.onSuccess()
-	if !cb.canExecute() {
+	cb.OnSuccess()
+	if !cb.CanExecute() {
 		t.Fatal("circuit breaker should be closed after success")
 	}
 }

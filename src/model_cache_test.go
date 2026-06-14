@@ -129,7 +129,7 @@ func TestModelCache_GetOrFetch_Concurrent(t *testing.T) {
 
 func TestModelCache_DefaultTTL(t *testing.T) {
 	c := NewModelCache(0)
-	if c.ttl != defaultModelCacheTTL {
-		t.Errorf("default TTL = %v, want %v", c.ttl, defaultModelCacheTTL)
+	if c.Ttl != DefaultModelCacheTTL {
+		t.Errorf("default TTL = %v, want %v", c.Ttl, DefaultModelCacheTTL)
 	}
 }

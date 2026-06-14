@@ -6,7 +6,7 @@
 //
 //   - buildChatGPTCodexRequest  — strict allowlist, forces stream/store
 //   - buildPlatformResponsesRequest — generic conversion, drop-list based
-package main
+package provider
 
 import (
 	"bufio"
@@ -17,8 +17,53 @@ import (
 	"log"
 	"net/http"
 	"strings"
+
+	"github.com/x51vn/github-copilot-svcs/internal/httputil"
 	"time"
 )
+
+// ValidateResponsesRequest returns an error if the body contains unsupported
+// Responses API fields that this proxy does not yet implement.
+func ValidateResponsesRequest(body []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	for _, field := range []string{"previous_response_id", "conversation", "include", "metadata"} {
+		if _, ok := raw[field]; ok {
+			return fmt.Errorf("field %q is not supported on this proxy yet", field)
+		}
+	}
+	return nil
+}
+
+// BuildChatCompletionsRequestFromResponses is the exported wrapper used by
+// the proxy layer to convert a /v1/responses body to /v1/chat/completions.
+func BuildChatCompletionsRequestFromResponses(respBody []byte) ([]byte, bool, error) {
+	return buildChatCompletionsRequestFromResponses(respBody)
+}
+
+// SanitizeResponsesBodyForProvider is the exported wrapper for proxy-layer
+// pre-dispatch sanitisation of /v1/responses bodies.
+func SanitizeResponsesBodyForProvider(body []byte, providerID ProviderID) []byte {
+	return sanitizeResponsesBodyForProvider(body, providerID)
+}
+
+// SanitizeChatBodyForProvider is the exported wrapper for proxy-layer
+// sanitisation of /v1/chat/completions bodies.
+func SanitizeChatBodyForProvider(body []byte, providerID ProviderID) []byte {
+	return sanitizeChatBodyForProvider(body, providerID)
+}
+
+// WriteResponsesCompatibilityResult writes the compatibility result to w.
+func WriteResponsesSSEFromChat(w http.ResponseWriter, statusCode int, header http.Header, body []byte) error {
+	return writeResponsesSSEFromChat(w, statusCode, header, body)
+}
+
+// WriteResponsesJSONFromChat writes the JSON result to w.
+func WriteResponsesJSONFromChat(w http.ResponseWriter, statusCode int, header http.Header, body []byte) error {
+	return writeResponsesJSONFromChat(w, statusCode, header, body)
+}
 
 type responsesRequest struct {
 	Model        string          `json:"model"`
@@ -254,7 +299,7 @@ func convertToolsForChat(raw json.RawMessage) interface{} {
 }
 
 func writeResponsesJSONFromChat(w http.ResponseWriter, statusCode int, header http.Header, body []byte) error {
-	copyHeaders(w, header, "Content-Length")
+	httputil.CopyHeaders(w, header, "Content-Length")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "*")
 	w.Header().Set("Content-Type", "application/json")
@@ -273,7 +318,7 @@ func writeResponsesJSONFromChat(w http.ResponseWriter, statusCode int, header ht
 }
 
 func writeResponsesSSEFromChat(w http.ResponseWriter, statusCode int, header http.Header, body []byte) error {
-	copyHeaders(w, header, "Content-Length")
+	httputil.CopyHeaders(w, header, "Content-Length")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "*")
 	w.Header().Set("Content-Type", "text/event-stream")

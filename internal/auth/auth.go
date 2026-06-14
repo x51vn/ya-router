@@ -1,6 +1,6 @@
 // auth.go — GitHub Copilot device-flow authentication helpers.
 // Functions operate on CopilotAuthState rather than the top-level Config.
-package main
+package auth
 
 import (
 	"encoding/json"
@@ -11,6 +11,9 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/x51vn/github-copilot-svcs/internal/config"
+	"github.com/x51vn/github-copilot-svcs/internal/httputil"
 )
 
 const (
@@ -24,9 +27,13 @@ const (
 	maxRefreshRetries = 3
 )
 
+const MaxRefreshRetries = maxRefreshRetries
+
 // baseRetryDelay is the retry backoff base in seconds.
 // Declared as a var so tests can set it to 0 to avoid sleeping.
 var baseRetryDelay = 2
+
+var BaseRetryDelay = &baseRetryDelay
 
 type deviceCodeResponse struct {
 	DeviceCode      string `json:"device_code"`
@@ -53,7 +60,7 @@ type copilotTokenResponse struct {
 
 // copilotAuthenticate runs the full GitHub device-flow and populates auth state.
 // save is called after the tokens are obtained to persist them.
-func copilotAuthenticate(auth *CopilotAuthState, save func() error) error {
+func CopilotAuthenticate(auth *config.CopilotAuthState, save func() error) error {
 	now := time.Now().Unix()
 	if auth.CopilotToken != "" && auth.ExpiresAt > now+60 {
 		log.Printf("Token still valid: expires in %d seconds", auth.ExpiresAt-now)
@@ -76,7 +83,7 @@ func copilotAuthenticate(auth *CopilotAuthState, save func() error) error {
 	req.Body = io.NopCloser(strings.NewReader(
 		fmt.Sprintf(`{"client_id":"%s","scope":"%s"}`, copilotClientID, copilotScope)))
 
-	resp, err := sharedHTTPClient.Do(req)
+	resp, err := httputil.SharedHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -126,7 +133,7 @@ func pollForGitHubToken(deviceCode string, interval int) (string, error) {
 			copilotClientID, deviceCode)
 		req.Body = io.NopCloser(strings.NewReader(body))
 
-		resp, err := sharedHTTPClient.Do(req)
+		resp, err := httputil.SharedHTTPClient.Do(req)
 		if err != nil {
 			continue
 		}
@@ -155,7 +162,7 @@ func getCopilotToken(githubToken string) (string, int64, int64, error) {
 	req.Header.Set("Authorization", "token "+githubToken)
 	req.Header.Set("User-Agent", userAgent)
 
-	resp, err := sharedHTTPClient.Do(req)
+	resp, err := httputil.SharedHTTPClient.Do(req)
 	if err != nil {
 		return "", 0, 0, err
 	}
@@ -173,7 +180,7 @@ func getCopilotToken(githubToken string) (string, int64, int64, error) {
 
 // copilotRefreshToken exchanges the long-lived GitHub token for a fresh Copilot token.
 // save is called after a successful refresh.
-func copilotRefreshToken(auth *CopilotAuthState, save func() error) error {
+func CopilotRefreshToken(auth *config.CopilotAuthState, save func() error) error {
 	if auth.GitHubToken == "" {
 		return errors.New("no GitHub token available for refresh")
 	}

@@ -1,5 +1,5 @@
 // config.go — application configuration with V0→V1 migration.
-package main
+package config
 
 import (
 	"encoding/json"
@@ -176,7 +176,9 @@ const (
 // configPathOverride lets tests redirect config I/O to a temp path.
 var configPathOverride string
 
-func getConfigPath() (string, error) {
+var ConfigPathOverride = &configPathOverride
+
+func GetConfigPath() (string, error) {
 	if configPathOverride != "" {
 		return configPathOverride, nil
 	}
@@ -192,8 +194,8 @@ func getConfigPath() (string, error) {
 }
 
 // loadConfig reads config from disk, auto-migrating V0 files to V1.
-func loadConfig() (*Config, error) {
-	path, err := getConfigPath()
+func LoadConfig() (*Config, error) {
+	path, err := GetConfigPath()
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +253,7 @@ func migrateV0ToV1(v0 *legacyV0Config) *Config {
 	if v0.DefaultModel != "" {
 		cfg.Routing.DefaultModel = v0.DefaultModel
 	}
-	cfg.Routing.DefaultProvider = string(ProviderCopilot)
+	cfg.Routing.DefaultProvider = "copilot"
 
 	t := &v0.Timeouts
 	setLegacyTimeouts(&cfg.Timeouts, t.HTTPClient, t.ServerRead, t.ServerWrite,
@@ -304,7 +306,7 @@ func defaultConfig() *Config {
 		ConfigVersion: currentConfigVersion,
 	}
 	cfg.Routing.DefaultModel = "gpt-5-mini"
-	cfg.Routing.DefaultProvider = string(ProviderCopilot)
+	cfg.Routing.DefaultProvider = "copilot"
 	cfg.Providers.Copilot.Enabled = true
 	cfg.Providers.Copilot.Auth.Mode = "device_code"
 	// allowed_models left empty = allow all models from upstream
@@ -323,7 +325,7 @@ func applyConfigDefaults(cfg *Config) {
 		cfg.Routing.DefaultModel = "gpt-5-mini"
 	}
 	if cfg.Routing.DefaultProvider == "" {
-		cfg.Routing.DefaultProvider = string(ProviderCopilot)
+		cfg.Routing.DefaultProvider = "copilot"
 	}
 	// allowed_models: empty = allow all models from upstream
 	if cfg.Providers.Codex.Auth.Mode == "" {
@@ -393,8 +395,8 @@ func setDefaultTimeouts(cfg *Config) {
 }
 
 // saveConfig writes cfg to disk atomically with 0600 permissions.
-func saveConfig(cfg *Config) error {
-	path, err := getConfigPath()
+func SaveConfig(cfg *Config) error {
+	path, err := GetConfigPath()
 	if err != nil {
 		return err
 	}
@@ -511,17 +513,15 @@ func mergeTimeouts(dst *TimeoutsConfig, src *TimeoutsConfig) {
 	}
 }
 
-// ensureCodexModelMap adds codex known models to routing.model_map if not
-// already present. Returns true if any entries were added (caller should save).
-func ensureCodexModelMap(cfg *Config) bool {
+func EnsureCodexModelMap(cfg *Config, modelIDs []string) bool {
 	if cfg.Routing.ModelMap == nil {
 		cfg.Routing.ModelMap = make(map[string]ModelMapEntry)
 	}
 	added := false
-	for _, m := range codexKnownModels {
-		if _, exists := cfg.Routing.ModelMap[m.ID]; !exists {
-			cfg.Routing.ModelMap[m.ID] = ModelMapEntry{Provider: string(ProviderCodex)}
-			fmt.Printf("  model_map: added %q → codex\n", m.ID)
+	for _, id := range modelIDs {
+		if _, exists := cfg.Routing.ModelMap[id]; !exists {
+			cfg.Routing.ModelMap[id] = ModelMapEntry{Provider: "codex"}
+			fmt.Printf("  model_map: added %q → codex\n", id)
 			added = true
 		}
 	}
@@ -529,11 +529,11 @@ func ensureCodexModelMap(cfg *Config) bool {
 }
 
 // migrateConfig upgrades the on-disk config according to mode.
-func migrateConfig(mode ConfigMigrationMode) error {
+func MigrateConfig(mode ConfigMigrationMode) error {
 	if mode == ConfigMigrationNone {
 		return nil
 	}
-	existingConfig, err := loadConfig()
+	existingConfig, err := LoadConfig()
 	if err != nil {
 		return fmt.Errorf("failed to load existing config: %w", err)
 	}
@@ -541,7 +541,7 @@ func migrateConfig(mode ConfigMigrationMode) error {
 	if err != nil {
 		return fmt.Errorf("failed to load default config: %w", err)
 	}
-	path, err := getConfigPath()
+	path, err := GetConfigPath()
 	if err != nil {
 		return err
 	}
@@ -549,9 +549,29 @@ func migrateConfig(mode ConfigMigrationMode) error {
 		return nil
 	}
 	mergedConfig := mergeConfigs(existingConfig, defConfig, mode)
-	if err := saveConfig(mergedConfig); err != nil {
+	if err := SaveConfig(mergedConfig); err != nil {
 		return fmt.Errorf("failed to save migrated config: %w", err)
 	}
 	fmt.Printf("Config migration completed (mode: %s)\n", mode)
 	return nil
 }
+
+// GetRuntimeStatePath returns the path to a runtime state file alongside the config file.
+func GetRuntimeStatePath(fileName string) (string, error) {
+	configPath, err := GetConfigPath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(configPath), fileName), nil
+}
+
+// Exported wrappers for test access.
+func DefaultConfig() *Config          { return defaultConfig() }
+func ApplyConfigDefaults(cfg *Config) { applyConfigDefaults(cfg) }
+func MergeConfigs(e *Config, d *Config, m ConfigMigrationMode) *Config {
+	return mergeConfigs(e, d, m)
+}
+func NormalizeCopilotAccounts(c *CopilotProviderConfig) { normalizeCopilotAccounts(c) }
+func NormalizeCodexAccounts(c *CodexProviderConfig)     { normalizeCodexAccounts(c) }
+func SetDefaultTimeouts(cfg *Config)                    { setDefaultTimeouts(cfg) }
+func LoadDefaultConfigFromExample() (*Config, error)    { return loadDefaultConfigFromExample() }

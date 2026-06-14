@@ -1,5 +1,5 @@
 // models.go — unified /v1/models handler and shared model utilities.
-package main
+package provider
 
 import (
 	"context"
@@ -8,6 +8,9 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/x51vn/github-copilot-svcs/internal/config"
+	"github.com/x51vn/github-copilot-svcs/internal/types"
 )
 
 // filterAllowedModels returns a copy of modelList containing only models that
@@ -21,12 +24,12 @@ import (
 //
 // If the allowedModels list is set but no models match, a synthetic entry for
 // each allowed ID is returned so clients can still see the allowed model names.
-func filterAllowedModels(modelList *ModelList, allowedModels []string) *ModelList {
+func filterAllowedModels(modelList *types.ModelList, allowedModels []string) *types.ModelList {
 	if len(allowedModels) == 0 {
 		return modelList
 	}
 
-	var filtered []Model
+	var filtered []types.Model
 	for _, m := range modelList.Data {
 		if isModelAllowedWithPrefix(m.ID, allowedModels) {
 			filtered = append(filtered, m)
@@ -36,7 +39,7 @@ func filterAllowedModels(modelList *ModelList, allowedModels []string) *ModelLis
 	if len(filtered) == 0 {
 		// Synthesise entries for each allowed ID so callers aren't left empty.
 		for _, id := range allowedModels {
-			filtered = append(filtered, Model{
+			filtered = append(filtered, types.Model{
 				ID:      id,
 				Object:  "model",
 				Created: time.Now().Unix(),
@@ -44,7 +47,7 @@ func filterAllowedModels(modelList *ModelList, allowedModels []string) *ModelLis
 			})
 		}
 	}
-	return &ModelList{Object: "list", Data: filtered}
+	return &types.ModelList{Object: "list", Data: filtered}
 }
 
 // isModelAllowedWithPrefix reports whether modelID is permitted by the
@@ -74,13 +77,17 @@ func isModelAllowedWithPrefix(modelID string, allowedModels []string) bool {
 // for Copilot, "oc-" for Codex) so clients can target a provider
 // deterministically.  The prefix is stripped by the router before any request
 // is forwarded to the upstream.
-func modelsHandler(registry *ProviderRegistry, cfg *Config) http.HandlerFunc {
+func ModelsHandler(registry *ProviderRegistry, cfg *config.Config) http.HandlerFunc {
+	return modelsHandler(registry, cfg)
+}
+
+func modelsHandler(registry *ProviderRegistry, cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 
 		seen := make(map[string]bool)
-		var allModels []Model
+		var allModels []types.Model
 
 		// 1. Collect models from each provider's upstream API and apply prefix.
 		//    Call EnsureAuthenticated first to give providers a chance
@@ -104,7 +111,7 @@ func modelsHandler(registry *ProviderRegistry, cfg *Config) http.HandlerFunc {
 					prefixedID := AddModelPrefix(p.ID(), m.ID)
 					if !seen[prefixedID] {
 						seen[prefixedID] = true
-						allModels = append(allModels, Model{
+						allModels = append(allModels, types.Model{
 							ID:      prefixedID,
 							Object:  m.Object,
 							Created: m.Created,
@@ -121,7 +128,7 @@ func modelsHandler(registry *ProviderRegistry, cfg *Config) http.HandlerFunc {
 			if !seen[modelID] {
 				seen[modelID] = true
 				ownedBy := ProviderOwnedBy(ProviderID(entry.Provider))
-				allModels = append(allModels, Model{
+				allModels = append(allModels, types.Model{
 					ID:      modelID,
 					Object:  "model",
 					Created: time.Now().Unix(),
@@ -130,9 +137,9 @@ func modelsHandler(registry *ProviderRegistry, cfg *Config) http.HandlerFunc {
 			}
 		}
 
-		resp := &ModelList{Object: "list", Data: allModels}
+		resp := &types.ModelList{Object: "list", Data: allModels}
 		if allModels == nil {
-			resp.Data = []Model{}
+			resp.Data = []types.Model{}
 		}
 		log.Printf("modelsHandler: returning %d models", len(resp.Data))
 

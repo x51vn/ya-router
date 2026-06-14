@@ -47,9 +47,9 @@ func TestLoadOfficialCodexModelsReadsCache(t *testing.T) {
 }
 
 func TestCodexKnownModelListIncludesLatestModels(t *testing.T) {
-	p := &CodexProvider{cfg: defaultConfig()}
+	p := &CodexProvider{Cfg: defaultConfig()}
 
-	ml := p.knownModelList()
+	ml := p.KnownModelList()
 	ids := make(map[string]bool, len(ml.Data))
 	for _, m := range ml.Data {
 		ids[m.ID] = true
@@ -67,8 +67,8 @@ func TestCodexProviderAuthBrokenReturns503(t *testing.T) {
 	t.Setenv("CODEX_HOME", emptyDir)
 
 	p := &CodexProvider{
-		cfg:        defaultConfig(),
-		authBroken: true,
+		Cfg:        defaultConfig(),
+		AuthBroken: true,
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
@@ -118,12 +118,12 @@ func TestCodexProviderAuthBrokenRecovery(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.Providers.Codex.Auth.Mode = "device_code"
 	p := &CodexProvider{
-		cfg:        cfg,
-		authBroken: true,
-		cb:         &CircuitBreaker{state: CircuitClosed, timeout: 30},
-		cache:      NewModelCache(defaultModelCacheTTL),
+		Cfg:        cfg,
+		AuthBroken: true,
+		Cb:         newCircuitBreakerWithState(CircuitClosed, 30),
+		Cache:      NewModelCache(DefaultModelCacheTTL),
 	}
-	p.proxyExecutor = func(_ context.Context, _ *http.Request, _ []byte, _ Capability) (*http.Response, string, error) {
+	p.ProxyExecutor = func(_ context.Context, _ *http.Request, _ []byte, _ Capability) (*http.Response, string, error) {
 		rec := httptest.NewRecorder()
 		rec.WriteHeader(http.StatusOK)
 		rec.Body.WriteString(`{"id":"chatcmpl-test","choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
@@ -143,9 +143,9 @@ func TestCodexProviderAuthBrokenRecovery(t *testing.T) {
 		t.Errorf("got auth_broken error after recovery: %v", err)
 	}
 
-	p.mu.Lock()
-	stillBroken := p.authBroken
-	p.mu.Unlock()
+	p.Mu.Lock()
+	stillBroken := p.AuthBroken
+	p.Mu.Unlock()
 	if stillBroken {
 		t.Errorf("authBroken should be false after recovery, still true")
 	}
@@ -180,11 +180,12 @@ func TestProxyRequestRetryOn401_RefreshSucceeds(t *testing.T) {
 	cfg.Providers.Codex.Auth.AccountID = "acc-123"
 
 	p := &CodexProvider{
-		cfg:   cfg,
-		cb:    &CircuitBreaker{state: CircuitClosed, timeout: 30},
-		cache: NewModelCache(defaultModelCacheTTL),
+		Cfg:   cfg,
+		Cb:    newCircuitBreakerWithState(CircuitClosed, 30),
+		Cache: NewModelCache(DefaultModelCacheTTL),
 	}
-	p.proxyExecutor = func(_ context.Context, _ *http.Request, _ []byte, _ Capability) (*http.Response, string, error) {
+	p.RefreshExecutor = codexRefreshToken
+	p.ProxyExecutor = func(_ context.Context, _ *http.Request, _ []byte, _ Capability) (*http.Response, string, error) {
 		callCount++
 		rec := httptest.NewRecorder()
 		if callCount == 1 {
@@ -242,11 +243,12 @@ func TestProxyRequestRetryOn401_RefreshFails(t *testing.T) {
 	cfg.Providers.Codex.Auth.AccountID = "acc-123"
 
 	p := &CodexProvider{
-		cfg:   cfg,
-		cb:    &CircuitBreaker{state: CircuitClosed, timeout: 30},
-		cache: NewModelCache(defaultModelCacheTTL),
+		Cfg:   cfg,
+		Cb:    newCircuitBreakerWithState(CircuitClosed, 30),
+		Cache: NewModelCache(DefaultModelCacheTTL),
 	}
-	p.proxyExecutor = func(_ context.Context, _ *http.Request, _ []byte, _ Capability) (*http.Response, string, error) {
+	p.RefreshExecutor = codexRefreshToken
+	p.ProxyExecutor = func(_ context.Context, _ *http.Request, _ []byte, _ Capability) (*http.Response, string, error) {
 		rec := httptest.NewRecorder()
 		rec.WriteHeader(http.StatusUnauthorized)
 		rec.Body.WriteString(`{"error":{"message":"unauthorized","code":"unauthorized_unknown"}}`)
@@ -305,11 +307,12 @@ func TestProxyRequestRetryOn401_RetryAlso401(t *testing.T) {
 	cfg.Providers.Codex.Auth.AccountID = "acc-123"
 
 	p := &CodexProvider{
-		cfg:   cfg,
-		cb:    &CircuitBreaker{state: CircuitClosed, timeout: 30},
-		cache: NewModelCache(defaultModelCacheTTL),
+		Cfg:   cfg,
+		Cb:    newCircuitBreakerWithState(CircuitClosed, 30),
+		Cache: NewModelCache(DefaultModelCacheTTL),
 	}
-	p.proxyExecutor = func(_ context.Context, _ *http.Request, _ []byte, _ Capability) (*http.Response, string, error) {
+	p.RefreshExecutor = codexRefreshToken
+	p.ProxyExecutor = func(_ context.Context, _ *http.Request, _ []byte, _ Capability) (*http.Response, string, error) {
 		callCount++
 		rec := httptest.NewRecorder()
 		rec.WriteHeader(http.StatusUnauthorized)
@@ -332,9 +335,9 @@ func TestProxyRequestRetryOn401_RetryAlso401(t *testing.T) {
 		t.Errorf("expected 401 passthrough after retry also fails, got %d", w.Code)
 	}
 
-	p.mu.Lock()
-	broken := p.authBroken
-	p.mu.Unlock()
+	p.Mu.Lock()
+	broken := p.AuthBroken
+	p.Mu.Unlock()
 	if broken {
 		t.Errorf("authBroken should NOT be set when retry 401 — only on unrecoverable refresh")
 	}

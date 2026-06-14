@@ -1,5 +1,5 @@
 // copilot_provider.go — GitHub Copilot backend provider implementation.
-package main
+package provider
 
 import (
 	"bytes"
@@ -13,33 +13,43 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	authpkg "github.com/x51vn/github-copilot-svcs/internal/auth"
+	"github.com/x51vn/github-copilot-svcs/internal/config"
+	"github.com/x51vn/github-copilot-svcs/internal/httputil"
+	"github.com/x51vn/github-copilot-svcs/internal/types"
+)
+
+const (
+	copilotAPIBase = "https://api.githubcopilot.com"
+	userAgent      = "github-copilot-svcs/1.0"
 )
 
 // CopilotProvider implements Provider for the GitHub Copilot backend.
 type CopilotProvider struct {
-	cfg               *Config // full config; Copilot auth lives at cfg.Providers.Copilot
-	mu                sync.Mutex
-	accountCursor     int // index into cfg.Providers.Copilot.Accounts; protected by mu
-	cb                *CircuitBreaker
-	mc                *CoalescingCache // ListModels request coalescing
-	cache             *ModelCache      // TTL-based model list cache
-	freeCatalog       *CopilotFreeCatalog
+	Cfg               *config.Config
+	Mu                sync.Mutex
+	AccountCursor     int
+	Cb                *httputil.CircuitBreaker
+	Mc                *httputil.CoalescingCache
+	Cache             *ModelCache
+	FreeCatalog       *CopilotFreeCatalog
 	freeModelCursor   atomic.Uint64
-	freeModelResolver func(ctx context.Context) ([]Model, error)
-	proxyExecutor     func(ctx context.Context, r *http.Request, body []byte, cap Capability) (*http.Response, string, error)
+	FreeModelResolver func(ctx context.Context) ([]types.Model, error)
+	ProxyExecutor     func(ctx context.Context, r *http.Request, body []byte, cap Capability) (*http.Response, string, error)
 }
 
 // NewCopilotProvider constructs a CopilotProvider backed by cfg.
-func NewCopilotProvider(cfg *Config) *CopilotProvider {
+func NewCopilotProvider(cfg *config.Config) *CopilotProvider {
 	timeout := time.Duration(cfg.Timeouts.CircuitBreaker) * time.Second
 	p := &CopilotProvider{
-		cfg:         cfg,
-		cb:          &CircuitBreaker{state: CircuitClosed, timeout: timeout},
-		mc:          NewCoalescingCache(),
-		cache:       NewModelCache(defaultModelCacheTTL),
-		freeCatalog: NewCopilotFreeCatalog(defaultFreeCatalogTTL),
+		Cfg:         cfg,
+		Cb:          httputil.NewCircuitBreaker(timeout),
+		Mc:          httputil.NewCoalescingCache(),
+		Cache:       NewModelCache(DefaultModelCacheTTL),
+		FreeCatalog: NewCopilotFreeCatalog(defaultFreeCatalogTTL),
 	}
-	p.accountCursor = p.firstHealthyAccount()
+	p.AccountCursor = p.FirstHealthyAccount()
 	return p
 }
 
@@ -50,35 +60,35 @@ func (p *CopilotProvider) Capabilities() []Capability {
 }
 
 // activeAccount returns the current pool entry. Returns nil when the pool is empty.
-func (p *CopilotProvider) activeAccount() *CopilotAccount {
-	accounts := p.cfg.Providers.Copilot.Accounts
+func (p *CopilotProvider) ActiveAccount() *config.CopilotAccount {
+	accounts := p.Cfg.Providers.Copilot.Accounts
 	if len(accounts) == 0 {
 		return nil
 	}
-	return &accounts[p.accountCursor]
+	return &accounts[p.AccountCursor]
 }
 
 // authState returns the auth state of the active account, falling back to the
 // legacy single-account Auth field when the pool is empty.
-func (p *CopilotProvider) authState() *CopilotAuthState {
-	if acc := p.activeAccount(); acc != nil {
+func (p *CopilotProvider) authState() *config.CopilotAuthState {
+	if acc := p.ActiveAccount(); acc != nil {
 		return &acc.Auth
 	}
-	return &p.cfg.Providers.Copilot.Auth
+	return &p.Cfg.Providers.Copilot.Auth
 }
 
 func (p *CopilotProvider) save() error {
-	return saveConfig(p.cfg)
+	return config.SaveConfig(p.Cfg)
 }
 
 func (p *CopilotProvider) cooldownSeconds() int64 {
-	if s := p.cfg.Providers.Copilot.AccountCooldownSeconds; s > 0 {
+	if s := p.Cfg.Providers.Copilot.AccountCooldownSeconds; s > 0 {
 		return int64(s)
 	}
 	return 300
 }
 
-func (p *CopilotProvider) isAccountInCooldown(acc *CopilotAccount) bool {
+func (p *CopilotProvider) isAccountInCooldown(acc *config.CopilotAccount) bool {
 	if acc.LastLimitedAt == 0 {
 		return false
 	}
@@ -87,8 +97,8 @@ func (p *CopilotProvider) isAccountInCooldown(acc *CopilotAccount) bool {
 
 // firstHealthyAccount returns the index of the first account not in cooldown,
 // or 0 if all are in cooldown.
-func (p *CopilotProvider) firstHealthyAccount() int {
-	accounts := p.cfg.Providers.Copilot.Accounts
+func (p *CopilotProvider) FirstHealthyAccount() int {
+	accounts := p.Cfg.Providers.Copilot.Accounts
 	for i := range accounts {
 		if !p.isAccountInCooldown(&accounts[i]) {
 			return i
@@ -100,17 +110,17 @@ func (p *CopilotProvider) firstHealthyAccount() int {
 // advanceAccount marks the current account as rate-limited, then advances the
 // cursor to the next non-cooldown account in the pool.
 // Returns true if a new healthy account was found, false if all are exhausted.
-func (p *CopilotProvider) advanceAccount() bool {
-	accounts := p.cfg.Providers.Copilot.Accounts
+func (p *CopilotProvider) AdvanceAccount() bool {
+	accounts := p.Cfg.Providers.Copilot.Accounts
 	if len(accounts) <= 1 {
 		return false
 	}
-	accounts[p.accountCursor].LastLimitedAt = time.Now().Unix()
+	accounts[p.AccountCursor].LastLimitedAt = time.Now().Unix()
 	size := len(accounts)
 	for i := 1; i < size; i++ {
-		next := (p.accountCursor + i) % size
+		next := (p.AccountCursor + i) % size
 		if !p.isAccountInCooldown(&accounts[next]) {
-			p.accountCursor = next
+			p.AccountCursor = next
 			return true
 		}
 	}
@@ -119,37 +129,37 @@ func (p *CopilotProvider) advanceAccount() bool {
 
 // EnsureAuthenticated ensures the Copilot bearer token is valid.
 func (p *CopilotProvider) EnsureAuthenticated(ctx context.Context) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.Mu.Lock()
+	defer p.Mu.Unlock()
 
-	auth := p.authState()
-	if auth.CopilotToken == "" {
-		return copilotAuthenticate(auth, p.save)
+	copilotAuth := p.authState()
+	if copilotAuth.CopilotToken == "" {
+		return authpkg.CopilotAuthenticate(copilotAuth, p.save)
 	}
 
 	now := time.Now().Unix()
 	threshold := int64(300) // 5 min default
-	if auth.RefreshIn > 0 {
-		if t := auth.RefreshIn / 5; t > threshold {
+	if copilotAuth.RefreshIn > 0 {
+		if t := copilotAuth.RefreshIn / 5; t > threshold {
 			threshold = t
 		}
 	}
-	if auth.ExpiresAt-now <= threshold {
-		if err := copilotRefreshToken(auth, p.save); err != nil {
+	if copilotAuth.ExpiresAt-now <= threshold {
+		if err := authpkg.CopilotRefreshToken(copilotAuth, p.save); err != nil {
 			log.Printf("Copilot refresh failed, re-authenticating: %v", err)
-			return copilotAuthenticate(auth, p.save)
+			return authpkg.CopilotAuthenticate(copilotAuth, p.save)
 		}
 	}
 	return nil
 }
 
-func (p *CopilotProvider) ListModels(ctx context.Context) (*ModelList, error) {
+func (p *CopilotProvider) ListModels(ctx context.Context) (*types.ModelList, error) {
 	raw, err := p.listRawModels(ctx)
 	if err != nil {
 		return nil, err
 	}
 	seen := make(map[string]bool)
-	var deduped []Model
+	var deduped []types.Model
 	for _, m := range raw.Data {
 		if !seen[m.ID] {
 			seen[m.ID] = true
@@ -160,13 +170,13 @@ func (p *CopilotProvider) ListModels(ctx context.Context) (*ModelList, error) {
 	return raw, nil
 }
 
-func (p *CopilotProvider) listRawModels(ctx context.Context) (*ModelList, error) {
+func (p *CopilotProvider) listRawModels(ctx context.Context) (*types.ModelList, error) {
 	if err := p.EnsureAuthenticated(ctx); err != nil {
 		return nil, err
 	}
-	ml, err := p.cache.GetOrFetch(func() (*ModelList, error) {
-		key := p.mc.getRequestKey("GET", copilotAPIBase+"/models", nil)
-		result := p.mc.CoalesceRequest(key, func() interface{} {
+	ml, err := p.Cache.GetOrFetch(func() (*types.ModelList, error) {
+		key := p.Mc.GetRequestKey("GET", copilotAPIBase+"/models", nil)
+		result := p.Mc.CoalesceRequest(key, func() interface{} {
 			raw, fetchErr := p.fetchModelsRaw()
 			if fetchErr != nil {
 				return fetchErr
@@ -176,7 +186,7 @@ func (p *CopilotProvider) listRawModels(ctx context.Context) (*ModelList, error)
 		if err, ok := result.(error); ok {
 			return nil, err
 		}
-		return cloneModelList(result.(*ModelList)), nil
+		return cloneModelList(result.(*types.ModelList)), nil
 	})
 	if err != nil {
 		return nil, err
@@ -184,17 +194,17 @@ func (p *CopilotProvider) listRawModels(ctx context.Context) (*ModelList, error)
 	return cloneModelList(ml), nil
 }
 
-func (p *CopilotProvider) fetchModelsRaw() (*ModelList, error) {
+func (p *CopilotProvider) fetchModelsRaw() (*types.ModelList, error) {
 	token := p.authState().CopilotToken
 	if token == "" {
-		return &ModelList{Object: "list", Data: nil}, nil
+		return &types.ModelList{Object: "list", Data: nil}, nil
 	}
 	req, err := http.NewRequest("GET", copilotAPIBase+"/models", nil)
 	if err != nil {
 		return nil, err
 	}
 	p.setCopilotHeaders(req, token, CapabilityChat)
-	resp, err := sharedHTTPClient.Do(req)
+	resp, err := httputil.SharedHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -203,7 +213,7 @@ func (p *CopilotProvider) fetchModelsRaw() (*ModelList, error) {
 		log.Printf("Copilot /models returned %d", resp.StatusCode)
 		return nil, fmt.Errorf("copilot /models: HTTP %d", resp.StatusCode)
 	}
-	var ml ModelList
+	var ml types.ModelList
 	if err := json.NewDecoder(resp.Body).Decode(&ml); err != nil {
 		return nil, err
 	}
@@ -235,7 +245,7 @@ func (p *CopilotProvider) executeProxyRequest(
 		log.Printf("[copilot] auth failed: %v", err)
 		return nil, "", fmt.Errorf("copilot auth: %w", err)
 	}
-	if !p.cb.canExecute() {
+	if !p.Cb.CanExecute() {
 		log.Printf("[copilot] circuit breaker OPEN — rejecting request")
 		return nil, "", fmt.Errorf("copilot circuit breaker is open")
 	}
@@ -260,10 +270,10 @@ func (p *CopilotProvider) executeProxyRequest(
 	}
 	p.setCopilotHeaders(req, p.authState().CopilotToken, cap)
 
-	resp, err := makeRequestWithRetry(sharedHTTPClient, req, body)
+	resp, err := httputil.MakeRequestWithRetry(httputil.SharedHTTPClient, req, body)
 	if err != nil {
 		log.Printf("[copilot] upstream error: %v", err)
-		p.cb.onFailure()
+		p.Cb.OnFailure()
 		return nil, "", err
 	}
 
@@ -277,10 +287,10 @@ func (p *CopilotProvider) executeProxyRequest(
 	}
 
 	if resp.StatusCode < 500 {
-		p.cb.onSuccess()
+		p.Cb.OnSuccess()
 	} else {
 		log.Printf("[copilot] upstream 5xx error — circuit breaker failure")
-		p.cb.onFailure()
+		p.Cb.OnFailure()
 	}
 
 	return resp, embedModel, nil
@@ -297,7 +307,7 @@ func (p *CopilotProvider) writeProxyResponse(
 	if cap == CapabilityEmbeddings && resp.Header.Get("Content-Type") != "text/event-stream" {
 		return writeCopilotEmbeddingsResponse(w, resp, embedModel)
 	}
-	return streamResponse(w, resp)
+	return httputil.StreamResponse(w, resp)
 }
 
 func (p *CopilotProvider) ProxyFreeChatRequest(
@@ -307,7 +317,7 @@ func (p *CopilotProvider) ProxyFreeChatRequest(
 	body []byte,
 	requestedModel string,
 ) error {
-	accounts := p.cfg.Providers.Copilot.Accounts
+	accounts := p.Cfg.Providers.Copilot.Accounts
 	maxAccountAttempts := max(1, len(accounts))
 
 	for accountAttempt := 0; accountAttempt < maxAccountAttempts; accountAttempt++ {
@@ -359,9 +369,9 @@ func (p *CopilotProvider) ProxyFreeChatRequest(
 		}
 
 		if lastLimitResp != nil && modelExhausted {
-			p.mu.Lock()
-			advanced := p.advanceAccount()
-			p.mu.Unlock()
+			p.Mu.Lock()
+			advanced := p.AdvanceAccount()
+			p.Mu.Unlock()
 			if advanced {
 				log.Printf("[copilot-free] all models rate-limited on current account; switching to next account")
 				continue
@@ -374,15 +384,15 @@ func (p *CopilotProvider) ProxyFreeChatRequest(
 	return fmt.Errorf("copilot free-model failover exhausted")
 }
 
-func (p *CopilotProvider) resolveFreeChatModels(ctx context.Context) ([]Model, error) {
-	if p.freeModelResolver != nil {
-		return p.freeModelResolver(ctx)
+func (p *CopilotProvider) resolveFreeChatModels(ctx context.Context) ([]types.Model, error) {
+	if p.FreeModelResolver != nil {
+		return p.FreeModelResolver(ctx)
 	}
-	if p.freeCatalog == nil {
-		p.freeCatalog = NewCopilotFreeCatalog(defaultFreeCatalogTTL)
+	if p.FreeCatalog == nil {
+		p.FreeCatalog = NewCopilotFreeCatalog(defaultFreeCatalogTTL)
 	}
 
-	docEligible, err := p.freeCatalog.EligibleModels(ctx)
+	docEligible, err := p.FreeCatalog.EligibleModels(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("copilot free catalog unavailable: %w", err)
 	}
@@ -397,12 +407,12 @@ func (p *CopilotProvider) resolveFreeChatModels(ctx context.Context) ([]Model, e
 	return effective, nil
 }
 
-func (p *CopilotProvider) nextFreeChatAttemptOrder(models []Model) []Model {
+func (p *CopilotProvider) nextFreeChatAttemptOrder(models []types.Model) []types.Model {
 	if len(models) <= 1 {
-		return append([]Model(nil), models...)
+		return append([]types.Model(nil), models...)
 	}
 	start := int(p.freeModelCursor.Add(1)-1) % len(models)
-	ordered := make([]Model, 0, len(models))
+	ordered := make([]types.Model, 0, len(models))
 	ordered = append(ordered, models[start:]...)
 	ordered = append(ordered, models[:start]...)
 	return ordered
@@ -414,8 +424,8 @@ func (p *CopilotProvider) executeProxy(
 	body []byte,
 	cap Capability,
 ) (*http.Response, string, error) {
-	if p.proxyExecutor != nil {
-		return p.proxyExecutor(ctx, r, body, cap)
+	if p.ProxyExecutor != nil {
+		return p.ProxyExecutor(ctx, r, body, cap)
 	}
 	return p.executeProxyRequest(ctx, r, body, cap)
 }
@@ -501,7 +511,7 @@ func writeCopilotEmbeddingsResponse(w http.ResponseWriter, resp *http.Response, 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		body = ensureEmbeddingsResponseCompat(body, embedModel)
 	}
-	copyHeaders(w, resp.Header, "Content-Length")
+	httputil.CopyHeaders(w, resp.Header, "Content-Length")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "*")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
@@ -512,14 +522,14 @@ func writeCopilotEmbeddingsResponse(w http.ResponseWriter, resp *http.Response, 
 
 // Health returns the provider's current authentication state.
 func (p *CopilotProvider) Health(_ context.Context) ProviderHealth {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	auth := p.authState()
-	hasRefresh := auth.GitHubToken != ""
-	authenticated := auth.CopilotToken != "" && auth.ExpiresAt > time.Now().Unix()
+	p.Mu.Lock()
+	defer p.Mu.Unlock()
+	copilotAuth := p.authState()
+	hasRefresh := copilotAuth.GitHubToken != ""
+	authenticated := copilotAuth.CopilotToken != "" && copilotAuth.ExpiresAt > time.Now().Unix()
 	return ProviderHealth{
 		Authenticated: authenticated,
 		CanRefresh:    hasRefresh,
-		LastRefreshAt: time.Unix(auth.ExpiresAt, 0),
+		LastRefreshAt: time.Unix(copilotAuth.ExpiresAt, 0),
 	}
 }

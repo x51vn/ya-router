@@ -1,41 +1,43 @@
 // model_cache.go — TTL-based model list cache to avoid repeated upstream calls.
-package main
+package provider
 
 import (
 	"log"
 	"sync"
 	"time"
+
+	"github.com/x51vn/github-copilot-svcs/internal/types"
 )
 
-const defaultModelCacheTTL = 10 * time.Minute
+const DefaultModelCacheTTL = 10 * time.Minute
 
 // ModelCache caches a ModelList result with a configurable TTL.
 // Concurrent callers are coalesced: only one fetch runs at a time,
 // and stale data is served while a background refresh is in progress.
 type ModelCache struct {
 	mu      sync.RWMutex
-	data    *ModelList
+	data    *types.ModelList
 	fetched time.Time
-	ttl     time.Duration
+	Ttl     time.Duration
 
 	// fetchMu serialises upstream fetches so only one runs at a time.
 	fetchMu sync.Mutex
 }
 
 // NewModelCache creates a cache with the given TTL.
-// If ttl <= 0, defaultModelCacheTTL is used.
-func NewModelCache(ttl time.Duration) *ModelCache {
-	if ttl <= 0 {
-		ttl = defaultModelCacheTTL
+// If Ttl <= 0, DefaultModelCacheTTL is used.
+func NewModelCache(Ttl time.Duration) *ModelCache {
+	if Ttl <= 0 {
+		Ttl = DefaultModelCacheTTL
 	}
-	return &ModelCache{ttl: ttl}
+	return &ModelCache{Ttl: Ttl}
 }
 
 // Get returns the cached model list if still fresh, or nil.
-func (c *ModelCache) Get() *ModelList {
+func (c *ModelCache) Get() *types.ModelList {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if c.data != nil && time.Since(c.fetched) < c.ttl {
+	if c.data != nil && time.Since(c.fetched) < c.Ttl {
 		return c.data
 	}
 	return nil
@@ -44,7 +46,7 @@ func (c *ModelCache) Get() *ModelList {
 // GetOrFetch returns cached data if fresh; otherwise calls fetchFn,
 // caches the result, and returns it. Only one fetch runs at a time;
 // concurrent callers wait for the same result.
-func (c *ModelCache) GetOrFetch(fetchFn func() (*ModelList, error)) (*ModelList, error) {
+func (c *ModelCache) GetOrFetch(fetchFn func() (*types.ModelList, error)) (*types.ModelList, error) {
 	if cached := c.Get(); cached != nil {
 		return cached, nil
 	}
@@ -67,12 +69,12 @@ func (c *ModelCache) GetOrFetch(fetchFn func() (*ModelList, error)) (*ModelList,
 }
 
 // Set stores a model list snapshot with the current timestamp.
-func (c *ModelCache) Set(ml *ModelList) {
+func (c *ModelCache) Set(ml *types.ModelList) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.data = ml
 	c.fetched = time.Now()
-	log.Printf("model cache: stored %d models (TTL %s)", len(ml.Data), c.ttl)
+	log.Printf("model cache: stored %d models (TTL %s)", len(ml.Data), c.Ttl)
 }
 
 // Invalidate clears the cache, forcing the next Get to miss.

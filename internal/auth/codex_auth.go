@@ -7,7 +7,7 @@
 //
 // For chatgpt mode, tokens are read from / written to the official Codex
 // auth store (~/.codex/auth.json or $CODEX_HOME/auth.json).
-package main
+package auth
 
 import (
 	"encoding/base64"
@@ -24,19 +24,23 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/x51vn/github-copilot-svcs/internal/config"
+	"github.com/x51vn/github-copilot-svcs/internal/httputil"
+	"github.com/x51vn/github-copilot-svcs/internal/types"
 )
 
 const (
-	codexCredentialSourceEnv           = "OPENAI_API_KEY environment variable"
-	codexCredentialSourceOfficialStore = "official Codex auth store"
-	codexCredentialSourceProxyConfig   = "proxy config fallback"
+	CodexCredentialSourceEnv           = "OPENAI_API_KEY environment variable"
+	CodexCredentialSourceOfficialStore = "official Codex auth store"
+	CodexCredentialSourceProxyConfig   = "proxy config fallback"
 )
 
 // errRefreshUnrecoverable is returned by codexRefreshToken when the server
 // responds with a permanent, non-retryable OAuth error (e.g. refresh_token_reused,
 // invalid_grant). Callers can use errors.Is to distinguish this from transient
 // failures that may resolve on retry.
-var errRefreshUnrecoverable = errors.New("unrecoverable refresh error")
+var ErrRefreshUnrecoverable = errors.New("unrecoverable refresh error")
 
 // unrecoverableRefreshCodes lists OAuth error codes that indicate the refresh
 // token is permanently invalid and retrying will never succeed.
@@ -62,7 +66,9 @@ func isUnrecoverableRefreshError(body []byte) bool {
 	return unrecoverableRefreshCodes[envelope.Error.Code]
 }
 
-type resolvedCodexChatGPTAuth struct {
+func IsUnrecoverableRefreshError(body []byte) bool { return isUnrecoverableRefreshError(body) }
+
+type ResolvedCodexChatGPTAuth struct {
 	AccessToken  string
 	RefreshToken string
 	ExpiresAt    int64
@@ -74,9 +80,11 @@ type resolvedCodexChatGPTAuth struct {
 // Declared as a var so tests can override it to point at a local httptest server.
 var codexAuthIssuer = "https://auth.openai.com"
 
+var CodexAuthIssuer = &codexAuthIssuer
+
 const (
 	codexOAuthClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
-	codexUserAgent     = "github-copilot-svcs/1.0"
+	CodexUserAgent     = "github-copilot-svcs/1.0"
 )
 
 // Step 1 response: device auth user code.
@@ -112,7 +120,7 @@ type codexRefreshResp struct {
 
 // codexAuthenticate runs the official Codex device-code flow and
 // persists the resulting tokens via save.
-func codexAuthenticate(auth *CodexAuthState, save func() error) error {
+func CodexAuthenticate(auth *config.CodexAuthState, save func() error) error {
 	now := time.Now().Unix()
 	if auth.AccessToken != "" && auth.ExpiresAt > now+60 {
 		log.Printf("Codex token still valid: expires in %d seconds",
@@ -144,9 +152,9 @@ func codexAuthenticate(auth *CodexAuthState, save func() error) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", codexUserAgent)
+	req.Header.Set("User-Agent", CodexUserAgent)
 
-	resp, err := sharedHTTPClient.Do(req)
+	resp, err := httputil.SharedHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("device code request failed: %w", err)
 	}
@@ -217,7 +225,7 @@ func codexAuthenticate(auth *CodexAuthState, save func() error) error {
 	// Extract account_id from id_token JWT — required for the
 	// chatgpt-account-id header sent to chatgpt.com/backend-api/.
 	if tokens.IDToken != "" {
-		if aid := extractAccountIDFromJWT(tokens.IDToken); aid != "" {
+		if aid := ExtractAccountIDFromJWT(tokens.IDToken); aid != "" {
 			auth.AccountID = aid
 			log.Printf("[codex] extracted account_id metadata from id_token")
 		} else {
@@ -256,9 +264,9 @@ func pollCodexDeviceToken(
 		return nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", codexUserAgent)
+	req.Header.Set("User-Agent", CodexUserAgent)
 
-	resp, err := sharedHTTPClient.Do(req)
+	resp, err := httputil.SharedHTTPClient.Do(req)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -294,9 +302,9 @@ func exchangeCodexAuthCode(
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", codexUserAgent)
+	req.Header.Set("User-Agent", CodexUserAgent)
 
-	resp, err := sharedHTTPClient.Do(req)
+	resp, err := httputil.SharedHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -331,14 +339,14 @@ func parseInt(s string) (int, error) {
 // such as the official Codex CLI), we adopt that token and skip the HTTP POST.
 // If the on-disk refresh token differs from ours, we use the on-disk value so
 // we don't present a stale, already-consumed token to the OAuth server.
-func codexRefreshToken(auth *CodexAuthState, save func() error) error {
+func CodexRefreshToken(auth *config.CodexAuthState, save func() error) error {
 	if auth.RefreshToken == "" {
 		return errors.New("no refresh token available for Codex")
 	}
 
 	// Reload-before-refresh guard: adopt on-disk credentials when the official
 	// Codex store was updated by another process since our last load.
-	if disk, err := loadOfficialCodexAuth(); err == nil && disk != nil {
+	if disk, err := LoadOfficialCodexAuth(); err == nil && disk != nil {
 		now := time.Now().Unix()
 		if disk.AccessToken != "" && disk.ExpiresAt > now+300 {
 			// On-disk token is fresh — no HTTP call needed.
@@ -378,9 +386,9 @@ func codexRefreshToken(auth *CodexAuthState, save func() error) error {
 			return err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", codexUserAgent)
+		req.Header.Set("User-Agent", CodexUserAgent)
 
-		resp, err := sharedHTTPClient.Do(req)
+		resp, err := httputil.SharedHTTPClient.Do(req)
 		if err != nil {
 			if attempt == maxRefreshRetries {
 				return fmt.Errorf("refresh failed after %d attempts: %w",
@@ -399,7 +407,7 @@ func codexRefreshToken(auth *CodexAuthState, save func() error) error {
 			errMsg := string(body)
 			if isUnrecoverableRefreshError(body) {
 				return fmt.Errorf("refresh error (status %d): %s: %w",
-					resp.StatusCode, errMsg, errRefreshUnrecoverable)
+					resp.StatusCode, errMsg, ErrRefreshUnrecoverable)
 			}
 			if attempt == maxRefreshRetries {
 				return fmt.Errorf("refresh error (status %d): %s",
@@ -426,7 +434,7 @@ func codexRefreshToken(auth *CodexAuthState, save func() error) error {
 		}
 		// Update account_id if the refresh response includes a new id_token.
 		if rr.IDToken != "" {
-			if aid := extractAccountIDFromJWT(rr.IDToken); aid != "" {
+			if aid := ExtractAccountIDFromJWT(rr.IDToken); aid != "" {
 				auth.AccountID = aid
 				log.Printf("[codex] updated account_id metadata from refreshed id_token")
 			}
@@ -438,8 +446,8 @@ func codexRefreshToken(auth *CodexAuthState, save func() error) error {
 		}
 
 		// Also persist refreshed tokens to the official Codex store.
-		if isChatGPTMode(auth.Mode) {
-			if err := persistToOfficialStore(auth); err != nil {
+		if IsChatGPTMode(auth.Mode) {
+			if err := PersistToOfficialStore(auth); err != nil {
 				log.Printf("[codex] warning: failed to persist refreshed tokens to official store: %v", err)
 			}
 		}
@@ -453,9 +461,9 @@ func codexRefreshToken(auth *CodexAuthState, save func() error) error {
 // Official Codex auth store (~/.codex/auth.json)
 // -----------------------------------------------------------------------
 
-// officialCodexAuthJSON mirrors the on-disk auth.json used by the
+// OfficialCodexAuthJSON mirrors the on-disk auth.json used by the
 // official openai/codex CLI.
-type officialCodexAuthJSON struct {
+type OfficialCodexAuthJSON struct {
 	OpenAIAPIKey *string            `json:"OPENAI_API_KEY"`
 	Tokens       *officialTokenData `json:"tokens"`
 	LastRefresh  *string            `json:"last_refresh"`
@@ -470,8 +478,10 @@ type officialTokenData struct {
 	AccountID    *string `json:"account_id,omitempty"`
 }
 
+type OfficialTokenData = officialTokenData
+
 // isChatGPTMode returns true for any mode that uses the ChatGPT backend.
-func isChatGPTMode(mode string) bool {
+func IsChatGPTMode(mode string) bool {
 	switch mode {
 	case "chatgpt", "device_code", "chatgpt_device_auth":
 		return true
@@ -481,54 +491,54 @@ func isChatGPTMode(mode string) bool {
 }
 
 // isAPIKeyMode returns true for explicit API key mode.
-func isAPIKeyMode(mode string) bool {
+func IsAPIKeyMode(mode string) bool {
 	return mode == "api_key"
 }
 
-func resolveCodexAPIKey(auth *CodexAuthState) (string, string, error) {
+func ResolveCodexAPIKey(auth *config.CodexAuthState) (string, string, error) {
 	if key := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); key != "" {
-		return key, codexCredentialSourceEnv, nil
+		return key, CodexCredentialSourceEnv, nil
 	}
 	if auth != nil && strings.TrimSpace(auth.APIKey) != "" {
-		return auth.APIKey, codexCredentialSourceProxyConfig, nil
+		return auth.APIKey, CodexCredentialSourceProxyConfig, nil
 	}
-	official, err := loadOfficialCodexAuth()
+	official, err := LoadOfficialCodexAuth()
 	if err != nil {
 		return "", "", err
 	}
 	if official != nil && strings.TrimSpace(official.APIKey) != "" {
-		return official.APIKey, codexCredentialSourceOfficialStore, nil
+		return official.APIKey, CodexCredentialSourceOfficialStore, nil
 	}
 	return "", "", nil
 }
 
-func resolveCodexChatGPTAuth(auth *CodexAuthState) (*resolvedCodexChatGPTAuth, error) {
-	official, err := loadOfficialCodexAuth()
+func ResolveCodexChatGPTAuth(auth *config.CodexAuthState) (*ResolvedCodexChatGPTAuth, error) {
+	official, err := LoadOfficialCodexAuth()
 	if err != nil {
 		return nil, err
 	}
 	if official != nil && official.AccessToken != "" {
-		return &resolvedCodexChatGPTAuth{
+		return &ResolvedCodexChatGPTAuth{
 			AccessToken:  official.AccessToken,
 			RefreshToken: official.RefreshToken,
 			ExpiresAt:    official.ExpiresAt,
 			AccountID:    official.AccountID,
-			Source:       codexCredentialSourceOfficialStore,
+			Source:       CodexCredentialSourceOfficialStore,
 		}, nil
 	}
 	if auth != nil && auth.AccessToken != "" {
-		return &resolvedCodexChatGPTAuth{
+		return &ResolvedCodexChatGPTAuth{
 			AccessToken:  auth.AccessToken,
 			RefreshToken: auth.RefreshToken,
 			ExpiresAt:    auth.ExpiresAt,
 			AccountID:    auth.AccountID,
-			Source:       codexCredentialSourceProxyConfig,
+			Source:       CodexCredentialSourceProxyConfig,
 		}, nil
 	}
 	return nil, nil
 }
 
-func applyResolvedCodexChatGPTAuth(dst *CodexAuthState, resolved *resolvedCodexChatGPTAuth) {
+func ApplyResolvedCodexChatGPTAuth(dst *config.CodexAuthState, resolved *ResolvedCodexChatGPTAuth) {
 	if dst == nil || resolved == nil {
 		return
 	}
@@ -538,7 +548,7 @@ func applyResolvedCodexChatGPTAuth(dst *CodexAuthState, resolved *resolvedCodexC
 	dst.AccountID = resolved.AccountID
 }
 
-func clearPersistedChatGPTSecrets(auth *CodexAuthState) {
+func ClearPersistedChatGPTSecrets(auth *config.CodexAuthState) {
 	if auth == nil {
 		return
 	}
@@ -562,7 +572,7 @@ func codexHomePath() (string, error) {
 }
 
 // officialAuthJSONPath returns the path to the official auth.json file.
-func officialAuthJSONPath() (string, error) {
+func OfficialAuthJSONPath() (string, error) {
 	ch, err := codexHomePath()
 	if err != nil {
 		return "", err
@@ -581,7 +591,7 @@ func officialModelsCachePath() (string, error) {
 
 // loadOfficialCodexModels reads the Codex CLI cache and returns supported
 // public model IDs. This avoids relying on the hardcoded fallback list.
-func loadOfficialCodexModels() ([]Model, error) {
+func LoadOfficialCodexModels() ([]types.Model, error) {
 	path, err := officialModelsCachePath()
 	if err != nil {
 		return nil, err
@@ -606,21 +616,21 @@ func loadOfficialCodexModels() ([]Model, error) {
 	}
 
 	seen := make(map[string]bool)
-	models := make([]Model, 0, len(payload.Models))
+	models := make([]types.Model, 0, len(payload.Models))
 	for _, item := range payload.Models {
 		if item.Slug == "" || !item.SupportedInAPI || item.Visibility == "hide" || seen[item.Slug] {
 			continue
 		}
 		seen[item.Slug] = true
-		models = append(models, Model{ID: item.Slug, Object: "model", OwnedBy: "openai"})
+		models = append(models, types.Model{ID: item.Slug, Object: "model", OwnedBy: "openai"})
 	}
 	return models, nil
 }
 
 // loadOfficialCodexAuth reads the official Codex auth store and
 // populates a CodexAuthState.  Returns nil, nil if no auth.json exists.
-func loadOfficialCodexAuth() (*CodexAuthState, error) {
-	path, err := officialAuthJSONPath()
+func LoadOfficialCodexAuth() (*config.CodexAuthState, error) {
+	path, err := OfficialAuthJSONPath()
 	if err != nil {
 		return nil, err
 	}
@@ -632,14 +642,14 @@ func loadOfficialCodexAuth() (*CodexAuthState, error) {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
 
-	var aj officialCodexAuthJSON
+	var aj OfficialCodexAuthJSON
 	if err := json.Unmarshal(data, &aj); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 
 	// API key mode.
 	if aj.OpenAIAPIKey != nil && *aj.OpenAIAPIKey != "" {
-		return &CodexAuthState{
+		return &config.CodexAuthState{
 			Mode:   "api_key",
 			APIKey: *aj.OpenAIAPIKey,
 		}, nil
@@ -650,7 +660,7 @@ func loadOfficialCodexAuth() (*CodexAuthState, error) {
 		return nil, nil
 	}
 
-	state := &CodexAuthState{
+	state := &config.CodexAuthState{
 		Mode:         "chatgpt",
 		AccessToken:  aj.Tokens.AccessToken,
 		RefreshToken: aj.Tokens.RefreshToken,
@@ -660,7 +670,7 @@ func loadOfficialCodexAuth() (*CodexAuthState, error) {
 	if aj.Tokens.AccountID != nil && *aj.Tokens.AccountID != "" {
 		state.AccountID = *aj.Tokens.AccountID
 	} else if aj.Tokens.IDToken != "" {
-		state.AccountID = extractAccountIDFromJWT(aj.Tokens.IDToken)
+		state.AccountID = ExtractAccountIDFromJWT(aj.Tokens.IDToken)
 	}
 
 	log.Printf("[codex] loaded official auth: has_token=true has_account_metadata=%t",
@@ -670,7 +680,7 @@ func loadOfficialCodexAuth() (*CodexAuthState, error) {
 
 // extractAccountIDFromJWT parses the id_token JWT to extract
 // chatgpt_account_id from the https://api.openai.com/auth claim.
-func extractAccountIDFromJWT(jwt string) string {
+func ExtractAccountIDFromJWT(jwt string) string {
 	parts := strings.SplitN(jwt, ".", 3)
 	if len(parts) < 2 {
 		return ""
@@ -696,8 +706,8 @@ func extractAccountIDFromJWT(jwt string) string {
 
 // persistToOfficialStore writes the current auth state to ~/.codex/auth.json
 // in the format expected by the official Codex CLI.
-func persistToOfficialStore(auth *CodexAuthState) error {
-	path, err := officialAuthJSONPath()
+func PersistToOfficialStore(auth *config.CodexAuthState) error {
+	path, err := OfficialAuthJSONPath()
 	if err != nil {
 		return err
 	}
@@ -707,7 +717,7 @@ func persistToOfficialStore(auth *CodexAuthState) error {
 	}
 
 	// Try to load existing to preserve id_token if available.
-	var existing officialCodexAuthJSON
+	var existing OfficialCodexAuthJSON
 	if data, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(data, &existing)
 	}
@@ -723,7 +733,7 @@ func persistToOfficialStore(auth *CodexAuthState) error {
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
-	aj := officialCodexAuthJSON{
+	aj := OfficialCodexAuthJSON{
 		Tokens: &officialTokenData{
 			IDToken:      idToken,
 			AccessToken:  auth.AccessToken,

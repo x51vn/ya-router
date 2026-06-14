@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"context"
@@ -10,9 +10,11 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/x51vn/github-copilot-svcs/internal/httputil"
 )
 
-func setupGracefulShutdown(server *http.Server) {
+func SetupGracefulShutdown(server *http.Server) {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 
@@ -20,8 +22,7 @@ func setupGracefulShutdown(server *http.Server) {
 		<-c
 		fmt.Println("\nGracefully shutting down...")
 
-		// Stop worker pool
-		globalWorkerPool.Stop()
+		httputil.GlobalWorkerPool.Stop()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -32,7 +33,7 @@ func setupGracefulShutdown(server *http.Server) {
 	}()
 }
 
-func healthHandler(w http.ResponseWriter, r *http.Request) {
+func HealthHandler(w http.ResponseWriter, r *http.Request) {
 	response := map[string]interface{}{
 		"status":    "ok",
 		"service":   "github-copilot-svcs",
@@ -42,7 +43,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-func setupLogging() {
+func SetupLogging() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.SetPrefix("[github-copilot-svcs] ")
 }

@@ -8,7 +8,7 @@
 //
 // The prefix is a proxy-internal naming convention only; it is stripped before
 // requests are forwarded to the upstream provider API.
-package main
+package provider
 
 import "strings"
 

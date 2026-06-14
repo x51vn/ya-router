@@ -510,14 +510,14 @@ func TestNormalizeCopilotAccounts_SkipsWhenAccountsPresent(t *testing.T) {
 
 func TestAdvanceAccount_AdvancesToNextHealthyAccount(t *testing.T) {
 	cfg := buildTestConfigWithAccounts(300, 0, 0)
-	p := &CopilotProvider{cfg: cfg}
+	p := &CopilotProvider{Cfg: cfg}
 
-	advanced := p.advanceAccount()
+	advanced := p.AdvanceAccount()
 	if !advanced {
 		t.Fatal("expected advance to succeed with 2 accounts")
 	}
-	if p.accountCursor != 1 {
-		t.Errorf("cursor = %d, want 1", p.accountCursor)
+	if p.AccountCursor != 1 {
+		t.Errorf("cursor = %d, want 1", p.AccountCursor)
 	}
 	if cfg.Providers.Copilot.Accounts[0].LastLimitedAt == 0 {
 		t.Error("account 0 LastLimitedAt should be set after advance")
@@ -526,8 +526,8 @@ func TestAdvanceAccount_AdvancesToNextHealthyAccount(t *testing.T) {
 
 func TestAdvanceAccount_ReturnsFalseOnSingleAccount(t *testing.T) {
 	cfg := buildTestConfigWithAccounts(300, 0)
-	p := &CopilotProvider{cfg: cfg}
-	if p.advanceAccount() {
+	p := &CopilotProvider{Cfg: cfg}
+	if p.AdvanceAccount() {
 		t.Error("expected false for single-account pool")
 	}
 }
@@ -539,8 +539,8 @@ func TestAdvanceAccount_SkipsCooldownAccounts(t *testing.T) {
 	accounts[1].LastLimitedAt = nowish
 	cfg.Providers.Copilot.Accounts = accounts
 
-	p := &CopilotProvider{cfg: cfg}
-	advanced := p.advanceAccount()
+	p := &CopilotProvider{Cfg: cfg}
+	advanced := p.AdvanceAccount()
 	if advanced {
 		t.Error("both accounts in cooldown; expected no advance")
 	}
@@ -587,8 +587,8 @@ func TestIsAccountLimitSignal_403WithoutRateLimit(t *testing.T) {
 func TestFirstHealthyAccount_SkipsCooldown(t *testing.T) {
 	nowish := time.Now().Unix()
 	cfg := buildTestConfigWithAccounts(300, nowish, 0)
-	p := &CopilotProvider{cfg: cfg}
-	idx := p.firstHealthyAccount()
+	p := &CopilotProvider{Cfg: cfg}
+	idx := p.FirstHealthyAccount()
 	if idx != 1 {
 		t.Errorf("expected account 1 (healthy), got %d", idx)
 	}
@@ -613,13 +613,13 @@ func TestProxyFreeChatRequest_AccountFailover(t *testing.T) {
 	cfg := buildTestConfigWithAccounts(300, 0, 0)
 
 	p := NewCopilotProvider(cfg)
-	p.freeModelResolver = func(_ context.Context) ([]Model, error) {
+	p.FreeModelResolver = func(_ context.Context) ([]Model, error) {
 		return []Model{{ID: "gpt-test"}}, nil
 	}
 
 	callCount := 0
-	p.proxyExecutor = func(_ context.Context, _ *http.Request, _ []byte, _ Capability) (*http.Response, string, error) {
-		acc := p.activeAccount()
+	p.ProxyExecutor = func(_ context.Context, _ *http.Request, _ []byte, _ Capability) (*http.Response, string, error) {
+		acc := p.ActiveAccount()
 		callCount++
 		if acc != nil && acc.Label == "acct-0" {
 			rec := httptest.NewRecorder()
@@ -639,8 +639,8 @@ func TestProxyFreeChatRequest_AccountFailover(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected no error after failover, got: %v", err)
 	}
-	if p.accountCursor != 1 {
-		t.Errorf("expected cursor=1 after failover, got %d", p.accountCursor)
+	if p.AccountCursor != 1 {
+		t.Errorf("expected cursor=1 after failover, got %d", p.AccountCursor)
 	}
 	if callCount < 2 {
 		t.Errorf("expected at least 2 proxy calls (one per account), got %d", callCount)
@@ -652,11 +652,11 @@ func TestProxyFreeChatRequest_AllAccountsExhausted(t *testing.T) {
 	cfg := buildTestConfigWithAccounts(300, 0, nowish)
 
 	p := NewCopilotProvider(cfg)
-	p.freeModelResolver = func(_ context.Context) ([]Model, error) {
+	p.FreeModelResolver = func(_ context.Context) ([]Model, error) {
 		return []Model{{ID: "gpt-test"}}, nil
 	}
 
-	p.proxyExecutor = func(_ context.Context, _ *http.Request, _ []byte, _ Capability) (*http.Response, string, error) {
+	p.ProxyExecutor = func(_ context.Context, _ *http.Request, _ []byte, _ Capability) (*http.Response, string, error) {
 		rec := httptest.NewRecorder()
 		rec.WriteHeader(http.StatusTooManyRequests)
 		rec.WriteString(`{"error":"rate limited"}`)
@@ -726,13 +726,13 @@ func TestNormalizeCodexAccounts_SkipsWhenAccountsPresent(t *testing.T) {
 func TestAdvanceCodexAccount_AdvancesToNextHealthyAccount(t *testing.T) {
 	cfg := buildTestCodexConfigWithAccounts(300, []string{"chatgpt", "chatgpt"}, 0, 0)
 	p := NewCodexProvider(cfg)
-	p.accountCursor = 0
-	advanced := p.advanceCodexAccount()
+	p.AccountCursor = 0
+	advanced := p.AdvanceCodexAccount()
 	if !advanced {
 		t.Error("expected advanceCodexAccount to return true")
 	}
-	if p.accountCursor != 1 {
-		t.Errorf("expected cursor=1, got %d", p.accountCursor)
+	if p.AccountCursor != 1 {
+		t.Errorf("expected cursor=1, got %d", p.AccountCursor)
 	}
 	if cfg.Providers.Codex.Accounts[0].LastLimitedAt == 0 {
 		t.Error("expected account 0 to have LastLimitedAt set")
@@ -742,7 +742,7 @@ func TestAdvanceCodexAccount_AdvancesToNextHealthyAccount(t *testing.T) {
 func TestAdvanceCodexAccount_ReturnsFalseOnSingleAccount(t *testing.T) {
 	cfg := buildTestCodexConfigWithAccounts(300, []string{"chatgpt"}, 0)
 	p := NewCodexProvider(cfg)
-	if p.advanceCodexAccount() {
+	if p.AdvanceCodexAccount() {
 		t.Error("expected false for single-account pool")
 	}
 }
@@ -755,17 +755,17 @@ func TestIsCodexAccountInCooldown(t *testing.T) {
 	p := NewCodexProvider(cfg)
 
 	recent := &CodexAccount{LastLimitedAt: nowish}
-	if !p.isCodexAccountInCooldown(recent) {
+	if !p.IsCodexAccountInCooldown(recent) {
 		t.Error("recently limited account should be in cooldown")
 	}
 
 	old := &CodexAccount{LastLimitedAt: nowish - 400}
-	if p.isCodexAccountInCooldown(old) {
+	if p.IsCodexAccountInCooldown(old) {
 		t.Error("old limited account should NOT be in cooldown")
 	}
 
 	zero := &CodexAccount{}
-	if p.isCodexAccountInCooldown(zero) {
+	if p.IsCodexAccountInCooldown(zero) {
 		t.Error("never-limited account should NOT be in cooldown")
 	}
 }
@@ -774,7 +774,7 @@ func TestFirstHealthyCodexAccount_SkipsCooldown(t *testing.T) {
 	nowish := time.Now().Unix()
 	cfg := buildTestCodexConfigWithAccounts(300, []string{"chatgpt", "chatgpt"}, nowish, 0)
 	p := NewCodexProvider(cfg)
-	idx := p.firstHealthyCodexAccount()
+	idx := p.FirstHealthyCodexAccount()
 	if idx != 1 {
 		t.Errorf("expected account 1 (healthy), got %d", idx)
 	}
@@ -783,11 +783,11 @@ func TestFirstHealthyCodexAccount_SkipsCooldown(t *testing.T) {
 func TestProxyCodexRequest_AccountFailover(t *testing.T) {
 	cfg := buildTestCodexConfigWithAccounts(300, []string{"chatgpt", "chatgpt"}, 0, 0)
 	p := NewCodexProvider(cfg)
-	p.accountCursor = 0
+	p.AccountCursor = 0
 
 	callCount := 0
-	p.proxyExecutor = func(_ context.Context, _ *http.Request, _ []byte, _ Capability) (*http.Response, string, error) {
-		acc := p.activeAccount()
+	p.ProxyExecutor = func(_ context.Context, _ *http.Request, _ []byte, _ Capability) (*http.Response, string, error) {
+		acc := p.ActiveAccount()
 		callCount++
 		if acc != nil && acc.Label == "codex-acct-0" {
 			rec := httptest.NewRecorder()
@@ -808,8 +808,8 @@ func TestProxyCodexRequest_AccountFailover(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected no error after failover, got: %v", err)
 	}
-	if p.accountCursor != 1 {
-		t.Errorf("expected cursor=1 after failover, got %d", p.accountCursor)
+	if p.AccountCursor != 1 {
+		t.Errorf("expected cursor=1 after failover, got %d", p.AccountCursor)
 	}
 	if callCount < 2 {
 		t.Errorf("expected at least 2 proxy calls (one per account), got %d", callCount)
@@ -820,9 +820,9 @@ func TestProxyCodexRequest_AllAccountsExhausted(t *testing.T) {
 	nowish := time.Now().Unix()
 	cfg := buildTestCodexConfigWithAccounts(300, []string{"chatgpt", "chatgpt"}, 0, nowish)
 	p := NewCodexProvider(cfg)
-	p.accountCursor = 0
+	p.AccountCursor = 0
 
-	p.proxyExecutor = func(_ context.Context, _ *http.Request, _ []byte, _ Capability) (*http.Response, string, error) {
+	p.ProxyExecutor = func(_ context.Context, _ *http.Request, _ []byte, _ Capability) (*http.Response, string, error) {
 		rec := httptest.NewRecorder()
 		rec.WriteHeader(http.StatusTooManyRequests)
 		rec.WriteString(`{"error":"rate limited"}`)
