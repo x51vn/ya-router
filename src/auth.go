@@ -22,8 +22,11 @@ const (
 	userAgent            = "GitHubCopilotChat/0.26.7"
 
 	maxRefreshRetries = 3
-	baseRetryDelay    = 2 // seconds
 )
+
+// baseRetryDelay is the retry backoff base in seconds.
+// Declared as a var so tests can set it to 0 to avoid sleeping.
+var baseRetryDelay = 2
 
 type deviceCodeResponse struct {
 	DeviceCode      string `json:"device_code"`

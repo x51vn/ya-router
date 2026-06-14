@@ -492,6 +492,8 @@ func handleRunWithMigration(migrationMode ConfigMigrationMode) error {
 	mux.HandleFunc("/v1/embeddings/", proxyHandler(registry, router, cfg))
 	mux.HandleFunc("/v1/chat/completions", proxyHandler(registry, router, cfg))
 	mux.HandleFunc("/v1/chat/completions/", proxyHandler(registry, router, cfg))
+	mux.HandleFunc("/v1/responses", proxyHandler(registry, router, cfg))
+	mux.HandleFunc("/v1/responses/", proxyHandler(registry, router, cfg))
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/health/", healthHandler)
 	if cfg.EnablePprof {
@@ -519,6 +521,7 @@ func handleRunWithMigration(migrationMode ConfigMigrationMode) error {
 	fmt.Printf("Starting proxy on :%d\n", port)
 	fmt.Printf("  /v1/models              → aggregated from all providers\n")
 	fmt.Printf("  /v1/chat/completions    → routed per model\n")
+	fmt.Printf("  /v1/responses           → routed per model\n")
 	fmt.Printf("  /v1/embeddings          → routed per model\n")
 	if cfg.EnablePprof {
 		fmt.Printf("  /debug/pprof/           → enabled\n")

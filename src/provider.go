@@ -22,6 +22,7 @@ type Capability string
 const (
 	CapabilityChat       Capability = "chat"
 	CapabilityEmbeddings Capability = "embeddings"
+	CapabilityResponses  Capability = "responses"
 )
 
 // ProviderHealth summarises a provider's current operational state.
@@ -73,6 +74,18 @@ type Provider interface {
 // own chat-model selection themselves instead of relying on router.Resolve.
 type FreeChatProxyProvider interface {
 	ProxyFreeChatRequest(
+		ctx context.Context,
+		w http.ResponseWriter,
+		r *http.Request,
+		body []byte,
+		requestedModel string,
+	) error
+}
+
+// ResponsesProxyProvider is an optional interface for providers that can
+// handle /v1/responses natively instead of going through chat-compat mode.
+type ResponsesProxyProvider interface {
+	ProxyResponsesRequest(
 		ctx context.Context,
 		w http.ResponseWriter,
 		r *http.Request,

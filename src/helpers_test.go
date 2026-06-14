@@ -17,6 +17,8 @@ type mockProvider struct {
 	proxyFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request, body []byte, cap Capability) error
 	// freeChatProxyFunc is called by ProxyFreeChatRequest if set.
 	freeChatProxyFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request, body []byte, requestedModel string) error
+	// responsesProxyFunc is called by ProxyResponsesRequest if set.
+	responsesProxyFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request, body []byte, requestedModel string) error
 }
 
 func (m *mockProvider) ID() ProviderID             { return m.id }
@@ -58,6 +60,20 @@ func (m *mockProvider) ProxyFreeChatRequest(
 ) error {
 	if m.freeChatProxyFunc != nil {
 		return m.freeChatProxyFunc(ctx, w, r, body, requestedModel)
+	}
+	w.WriteHeader(http.StatusOK)
+	return nil
+}
+
+func (m *mockProvider) ProxyResponsesRequest(
+	ctx context.Context,
+	w http.ResponseWriter,
+	r *http.Request,
+	body []byte,
+	requestedModel string,
+) error {
+	if m.responsesProxyFunc != nil {
+		return m.responsesProxyFunc(ctx, w, r, body, requestedModel)
 	}
 	w.WriteHeader(http.StatusOK)
 	return nil

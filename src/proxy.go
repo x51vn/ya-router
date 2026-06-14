@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -347,6 +348,8 @@ func capabilityFromPath(path string) (Capability, error) {
 	switch {
 	case strings.Contains(path, "/chat/completions"):
 		return CapabilityChat, nil
+	case strings.Contains(path, "/responses"):
+		return CapabilityResponses, nil
 	case strings.Contains(path, "/embeddings"):
 		return CapabilityEmbeddings, nil
 	default:
@@ -414,20 +417,27 @@ func processProxyRequest(
 	log.Printf("[REQ] %s %s model=%q capability=%s body_size=%d from=%s",
 		r.Method, r.URL.Path, requestedModel, cap, len(body), r.RemoteAddr)
 
+	if cap == CapabilityResponses {
+		return processResponsesRequest(registry, router, cfg, w, r, ctx, body, requestedModel, reqStart)
+	}
+
 	if cap == CapabilityChat {
-		if copilot, err := registry.Get(ProviderCopilot); err == nil {
-			if freeChatProvider, ok := copilot.(FreeChatProxyProvider); ok {
-				log.Printf("[REQ] Chat path ignoring client model=%q and delegating selection to Copilot free-model rotation", requestedModel)
-				proxyErr := freeChatProvider.ProxyFreeChatRequest(ctx, w, r, body, requestedModel)
-				elapsed := time.Since(reqStart)
-				if proxyErr != nil {
-					log.Printf("[REQ] COMPLETED %s %s model=%q provider=%s elapsed=%s ERROR: %v",
-						r.Method, r.URL.Path, requestedModel, copilot.ID(), elapsed, proxyErr)
-				} else {
-					log.Printf("[REQ] COMPLETED %s %s model=%q provider=%s elapsed=%s OK",
-						r.Method, r.URL.Path, requestedModel, copilot.ID(), elapsed)
+		_, prefixProvider, hasPrefix := StripModelPrefix(requestedModel)
+		if !hasPrefix || prefixProvider == ProviderCopilot {
+			if copilot, err := registry.Get(ProviderCopilot); err == nil {
+				if freeChatProvider, ok := copilot.(FreeChatProxyProvider); ok {
+					log.Printf("[REQ] Chat path ignoring client model=%q and delegating selection to Copilot free-model rotation", requestedModel)
+					proxyErr := freeChatProvider.ProxyFreeChatRequest(ctx, w, r, body, requestedModel)
+					elapsed := time.Since(reqStart)
+					if proxyErr != nil {
+						log.Printf("[REQ] COMPLETED %s %s model=%q provider=%s elapsed=%s ERROR: %v",
+							r.Method, r.URL.Path, requestedModel, copilot.ID(), elapsed, proxyErr)
+					} else {
+						log.Printf("[REQ] COMPLETED %s %s model=%q provider=%s elapsed=%s OK",
+							r.Method, r.URL.Path, requestedModel, copilot.ID(), elapsed)
+					}
+					return proxyErr
 				}
-				return proxyErr
 			}
 		}
 	}
@@ -456,4 +466,115 @@ func processProxyRequest(
 			r.Method, r.URL.Path, requestedModel, route.Provider.ID(), elapsed)
 	}
 	return proxyErr
+}
+
+func processResponsesRequest(
+	registry *ProviderRegistry,
+	router *ModelRouter,
+	_ *Config,
+	w http.ResponseWriter,
+	r *http.Request,
+	ctx context.Context,
+	body []byte,
+	requestedModel string,
+	reqStart time.Time,
+) error {
+	if err := validateResponsesRequest(body); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"error":{"message":%q,"type":"invalid_request_error","code":"unsupported_responses_feature"}}`, err.Error())))
+		log.Printf("[REQ] %s %s model=%q → invalid responses request: %v", r.Method, r.URL.Path, requestedModel, err)
+		return nil
+	}
+
+	route, err := router.Resolve(ctx, requestedModel, CapabilityChat)
+	if err != nil {
+		log.Printf("[REQ] %s %s model=%q → responses routing FAILED: %v", r.Method, r.URL.Path, requestedModel, err)
+		return fmt.Errorf("routing: %w", err)
+	}
+
+	if route.ResolvedModel != requestedModel {
+		log.Printf("[REQ] responses model rewritten: %q → %q", requestedModel, route.ResolvedModel)
+		body = patchBodyModel(body, route.ResolvedModel)
+	}
+
+	log.Printf("[REQ] Routing %s %s model=%q → provider=%s upstream_model=%q (responses)",
+		r.Method, r.URL.Path, requestedModel, route.Provider.ID(), route.ResolvedModel)
+
+	body = sanitizeResponsesBodyForProvider(body, route.Provider.ID())
+
+	if responsesProvider, ok := route.Provider.(ResponsesProxyProvider); ok {
+		proxyErr := responsesProvider.ProxyResponsesRequest(ctx, w, r, body, requestedModel)
+		elapsed := time.Since(reqStart)
+		if proxyErr != nil {
+			log.Printf("[REQ] COMPLETED %s %s model=%q provider=%s elapsed=%s ERROR: %v",
+				r.Method, r.URL.Path, requestedModel, route.Provider.ID(), elapsed, proxyErr)
+		} else {
+			log.Printf("[REQ] COMPLETED %s %s model=%q provider=%s elapsed=%s OK",
+				r.Method, r.URL.Path, requestedModel, route.Provider.ID(), elapsed)
+		}
+		return proxyErr
+	}
+
+	chatBody, streaming, err := buildChatCompletionsRequestFromResponses(body)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"error":{"message":%q,"type":"invalid_request_error","code":"unsupported_responses_feature"}}`, err.Error())))
+		return nil
+	}
+	chatBody = sanitizeChatBodyForProvider(chatBody, route.Provider.ID())
+
+	compatReq := r.Clone(ctx)
+	compatReq.URL.Path = "/v1/chat/completions"
+	compatReq.Body = io.NopCloser(bytes.NewReader(chatBody))
+
+	rr := httptestResponseRecorder{header: make(http.Header)}
+	proxyErr := route.Provider.ProxyRequest(ctx, &rr, compatReq, chatBody, CapabilityChat)
+	if proxyErr != nil {
+		elapsed := time.Since(reqStart)
+		log.Printf("[REQ] COMPLETED %s %s model=%q provider=%s elapsed=%s ERROR: %v",
+			r.Method, r.URL.Path, requestedModel, route.Provider.ID(), elapsed, proxyErr)
+		return proxyErr
+	}
+
+	return writeResponsesCompatibilityResult(w, &rr, streaming)
+}
+
+func validateResponsesRequest(body []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	for _, field := range []string{"previous_response_id", "conversation", "include", "metadata"} {
+		if _, ok := raw[field]; ok {
+			return fmt.Errorf("field %q is not supported on this proxy yet", field)
+		}
+	}
+	return nil
+}
+
+type httptestResponseRecorder struct {
+	header http.Header
+	body   bytes.Buffer
+	code   int
+}
+
+func (r *httptestResponseRecorder) Header() http.Header { return r.header }
+func (r *httptestResponseRecorder) Write(data []byte) (int, error) {
+	if r.code == 0 {
+		r.code = http.StatusOK
+	}
+	return r.body.Write(data)
+}
+func (r *httptestResponseRecorder) WriteHeader(statusCode int) { r.code = statusCode }
+
+func writeResponsesCompatibilityResult(w http.ResponseWriter, rr *httptestResponseRecorder, streaming bool) error {
+	if rr.code == 0 {
+		rr.code = http.StatusOK
+	}
+	if streaming {
+		return writeResponsesSSEFromChat(w, rr.code, rr.header, rr.body.Bytes())
+	}
+	return writeResponsesJSONFromChat(w, rr.code, rr.header, rr.body.Bytes())
 }

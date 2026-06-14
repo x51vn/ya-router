@@ -10,10 +10,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
@@ -30,6 +32,11 @@ type CodexProvider struct {
 	cb            *CircuitBreaker
 	cache         *ModelCache
 	accountCursor int
+	// authBroken is set when a permanent, unrecoverable refresh failure occurs
+	// (e.g. refresh_token_reused). Once set, all requests fail immediately with
+	// a 503 until the process is restarted with fresh credentials.
+	authBroken    bool
+	authBrokenErr error
 	// proxyExecutor is nil in production. Tests may set it to intercept outbound
 	// requests and return a synthetic response, bypassing real HTTP calls.
 	proxyExecutor func(ctx context.Context, r *http.Request, body []byte, cap Capability) (*http.Response, string, error)
@@ -67,6 +74,13 @@ func NewCodexProvider(cfg *Config) *CodexProvider {
 		cache: NewModelCache(defaultModelCacheTTL),
 	}
 	p.accountCursor = p.firstHealthyCodexAccount()
+	if path, err := officialAuthJSONPath(); err == nil {
+		if info, statErr := os.Stat(path); statErr == nil {
+			log.Printf("[codex] official auth path: %s (size=%d, mode=%s)", path, info.Size(), info.Mode())
+		} else {
+			log.Printf("[codex] official auth path: %s (not found: %v)", path, statErr)
+		}
+	}
 	return p
 }
 
@@ -204,6 +218,7 @@ func (p *CodexProvider) reloadFromOfficialStore() {
 		log.Printf("[codex] loaded fresh token from official store")
 		auth.AccessToken = official.AccessToken
 		auth.RefreshToken = official.RefreshToken
+		auth.ExpiresAt = official.ExpiresAt
 		auth.AccountID = official.AccountID
 	} else if auth.AccountID == "" && official.AccountID != "" {
 		auth.AccountID = official.AccountID
@@ -257,9 +272,21 @@ func (p *CodexProvider) EnsureAuthenticated(_ context.Context) error {
 			log.Printf("[codex] token expiring in %ds, refreshing...", remaining)
 			if err := codexRefreshToken(auth, p.save); err != nil {
 				log.Printf("[codex] refresh failed: %v", err)
-				p.reloadFromOfficialStore()
-				if auth.AccessToken == "" {
-					return fmt.Errorf("codex token expired and refresh failed: %w", err)
+				if errors.Is(err, errRefreshUnrecoverable) {
+					p.reloadFromOfficialStore()
+					freshAfterReload := auth.AccessToken != "" && auth.ExpiresAt > now+300
+					if !freshAfterReload {
+						p.authBroken = true
+						p.authBrokenErr = err
+						log.Printf("[codex] PERMANENT auth failure — re-authenticate with './github-copilot-svcs auth codex' and restart the service. All Codex requests will fail until then.")
+						return fmt.Errorf("codex auth broken (re-authenticate and restart): %w", err)
+					}
+				} else {
+					p.reloadFromOfficialStore()
+					freshAfterReload := auth.AccessToken != "" && auth.ExpiresAt > now+300
+					if !freshAfterReload {
+						return fmt.Errorf("codex token expired and refresh failed: %w", err)
+					}
 				}
 			} else {
 				log.Printf("[codex] token refreshed, new expiry in %ds",
@@ -286,12 +313,14 @@ func (p *CodexProvider) EnsureAuthenticated(_ context.Context) error {
 	return nil
 }
 
-// codexKnownModels is the canonical list of models supported by the Codex
-// backend, sourced from the official Codex CLI bundled models.json.
-// All entries have supported_in_api=true in the upstream source.
+// codexKnownModels is the fallback catalog used when the Codex backend
+// cannot enumerate models directly. It mirrors the latest slugs exposed by
+// the official Codex CLI models cache, including the 5.x family.
 var codexKnownModels = []Model{
-	{ID: "gpt-5.3-codex", Object: "model", OwnedBy: "openai"},
+	{ID: "gpt-5.5", Object: "model", OwnedBy: "openai"},
 	{ID: "gpt-5.4", Object: "model", OwnedBy: "openai"},
+	{ID: "gpt-5.4-mini", Object: "model", OwnedBy: "openai"},
+	{ID: "gpt-5.3-codex", Object: "model", OwnedBy: "openai"},
 	{ID: "gpt-5.2-codex", Object: "model", OwnedBy: "openai"},
 	{ID: "gpt-5.1-codex-max", Object: "model", OwnedBy: "openai"},
 	{ID: "gpt-5.1-codex", Object: "model", OwnedBy: "openai"},
@@ -320,16 +349,30 @@ func (p *CodexProvider) fetchModels(_ context.Context) (*ModelList, error) {
 	return p.knownModelList(), nil
 }
 
-// knownModelList returns the canonical Codex model list, merging the hardcoded
-// known models with any additional entries from routing.model_map.
+// knownModelList returns the canonical Codex model list by loading the
+// official Codex CLI cache first and falling back to the static catalog only
+// when the cache is unavailable.
 func (p *CodexProvider) knownModelList() *ModelList {
 	now := time.Now().Unix()
-	seen := make(map[string]bool, len(codexKnownModels))
 	models := make([]Model, 0, len(codexKnownModels))
-	for _, m := range codexKnownModels {
-		m.Created = now
+
+	if officialModels, err := loadOfficialCodexModels(); err != nil {
+		log.Printf("[codex] warning: failed to load official model cache: %v", err)
+	} else if len(officialModels) > 0 {
+		for i := range officialModels {
+			officialModels[i].Created = now
+		}
+		models = append(models, officialModels...)
+	} else {
+		for _, m := range codexKnownModels {
+			m.Created = now
+			models = append(models, m)
+		}
+	}
+
+	seen := make(map[string]bool, len(models))
+	for _, m := range models {
 		seen[m.ID] = true
-		models = append(models, m)
 	}
 	// Also include any routing.model_map entries targeting codex.
 	for modelID, entry := range p.cfg.Routing.ModelMap {
@@ -356,6 +399,24 @@ func (p *CodexProvider) ProxyRequest(
 	body []byte,
 	cap Capability,
 ) error {
+	p.mu.Lock()
+	if p.authBroken {
+		p.reloadFromOfficialStore()
+		auth := p.authState()
+		if auth.AccessToken != "" && auth.ExpiresAt > time.Now().Unix()+300 {
+			log.Printf("[codex] recovered from broken auth state via official store reload")
+			p.authBroken = false
+			p.authBrokenErr = nil
+		}
+	}
+	broken := p.authBroken
+	p.mu.Unlock()
+	if broken {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"message":"Codex authentication is broken. Re-authenticate with 'auth codex' and restart the service.","type":"authentication_error","code":"provider_auth_broken"}}`))
+		return nil
+	}
 	if err := p.EnsureAuthenticated(ctx); err != nil {
 		log.Printf("[codex] auth failed: %v", err)
 		return fmt.Errorf("codex auth: %w", err)
@@ -374,6 +435,7 @@ func (p *CodexProvider) ProxyRequest(
 	p.mu.Unlock()
 
 	var lastResp *http.Response
+	retriedOn401 := false
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		token, accountID, chatgpt := p.authCredentials()
 
@@ -436,6 +498,38 @@ func (p *CodexProvider) ProxyRequest(
 
 		log.Printf("[codex] upstream responded HTTP %d (Content-Type: %s)",
 			resp.StatusCode, resp.Header.Get("Content-Type"))
+
+		if resp.StatusCode == http.StatusUnauthorized && !retriedOn401 {
+			resp.Body.Close()
+			retriedOn401 = true
+			maxAttempts++
+			log.Printf("[codex] upstream 401 — refreshing token and retrying")
+			p.mu.Lock()
+			auth := p.authState()
+			auth.ExpiresAt = 1
+			p.mu.Unlock()
+			if err := p.EnsureAuthenticated(ctx); err != nil {
+				if errors.Is(err, errRefreshUnrecoverable) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_, _ = w.Write([]byte(`{"error":{"message":"Codex authentication is broken. Re-authenticate with 'auth codex' and restart the service.","type":"authentication_error","code":"provider_auth_broken"}}`))
+					return nil
+				}
+				log.Printf("[codex] 401-triggered refresh failed (transient): %v — returning 401 to client", err)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":{"message":"upstream authentication failed and token refresh failed","type":"authentication_error","code":"unauthorized"}}`))
+				return nil
+			}
+			log.Printf("[codex] token refreshed after 401, retrying upstream call")
+			continue
+		}
+
+		if resp.StatusCode == http.StatusUnauthorized && retriedOn401 {
+			log.Printf("[codex] upstream 401 persists after token refresh — passing through to client")
+			p.cb.onFailure()
+			return handleResponsesAPIResponse(w, resp, streaming, chatgpt, includeUsage)
+		}
 
 		isLimit, limitReason := isAccountLimitSignal(resp)
 		if isLimit && maxAttempts > 1 {
@@ -517,6 +611,171 @@ func (p *CodexProvider) proxyClassic(
 		p.cb.onFailure()
 	}
 	return streamResponse(w, resp)
+}
+
+func (p *CodexProvider) ProxyResponsesRequest(
+	ctx context.Context,
+	w http.ResponseWriter,
+	r *http.Request,
+	body []byte,
+	_ string,
+) error {
+	streaming := isStreamingRequest(body)
+	return p.proxyResponsesBody(ctx, w, r, body, streaming)
+}
+
+func (p *CodexProvider) proxyResponsesBody(
+	ctx context.Context,
+	w http.ResponseWriter,
+	r *http.Request,
+	body []byte,
+	streaming bool,
+) error {
+	p.mu.Lock()
+	if p.authBroken {
+		p.reloadFromOfficialStore()
+		auth := p.authState()
+		if auth.AccessToken != "" && auth.ExpiresAt > time.Now().Unix()+300 {
+			log.Printf("[codex] recovered from broken auth state via official store reload")
+			p.authBroken = false
+			p.authBrokenErr = nil
+		}
+	}
+	broken := p.authBroken
+	p.mu.Unlock()
+	if broken {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"message":"Codex authentication is broken. Re-authenticate with 'auth codex' and restart the service.","type":"authentication_error","code":"provider_auth_broken"}}`))
+		return nil
+	}
+	if err := p.EnsureAuthenticated(ctx); err != nil {
+		log.Printf("[codex] auth failed: %v", err)
+		return fmt.Errorf("codex auth: %w", err)
+	}
+	if !p.cb.canExecute() {
+		log.Printf("[codex] circuit breaker OPEN — rejecting request")
+		return fmt.Errorf("codex circuit breaker is open")
+	}
+
+	p.mu.Lock()
+	accounts := p.cfg.Providers.Codex.Accounts
+	maxAttempts := 1
+	if len(accounts) > 1 {
+		maxAttempts = len(accounts)
+	}
+	p.mu.Unlock()
+
+	var lastResp *http.Response
+	retriedOn401 := false
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		token, accountID, chatgpt := p.authCredentials()
+
+		upstreamURL := defaultPlatformBaseURL + "/responses"
+		responsesBody := body
+		includeUsage := false
+		if chatgpt {
+			upstreamURL = defaultChatGPTBaseURL + "responses"
+			var err error
+			responsesBody, includeUsage, err = buildChatGPTCodexRequestFromResponses(body)
+			if err != nil {
+				log.Printf("[codex] chatgpt responses request build failed: %v", err)
+				return err
+			}
+		}
+
+		log.Printf("[codex] proxying responses → %s (body %d bytes, stream=%v, mode=%s, attempt=%d/%d)",
+			upstreamURL, len(responsesBody), streaming,
+			map[bool]string{true: "chatgpt", false: "api_key"}[chatgpt], attempt+1, maxAttempts)
+
+		req, err := http.NewRequestWithContext(ctx, "POST", upstreamURL, bytes.NewBuffer(responsesBody))
+		if err != nil {
+			return err
+		}
+		if chatgpt {
+			setChatGPTHeaders(req, token, accountID)
+		} else {
+			setPlatformHeaders(req, token)
+		}
+
+		var resp *http.Response
+		if p.proxyExecutor != nil {
+			resp, _, err = p.proxyExecutor(ctx, req, responsesBody, CapabilityResponses)
+		} else {
+			resp, err = makeRequestWithRetry(sharedHTTPClient, req, responsesBody)
+		}
+		if err != nil {
+			log.Printf("[codex] upstream error: %v", err)
+			p.cb.onFailure()
+			return err
+		}
+
+		log.Printf("[codex] upstream responded HTTP %d (Content-Type: %s)",
+			resp.StatusCode, resp.Header.Get("Content-Type"))
+
+		if resp.StatusCode == http.StatusUnauthorized && !retriedOn401 {
+			resp.Body.Close()
+			retriedOn401 = true
+			maxAttempts++
+			log.Printf("[codex] upstream 401 — refreshing token and retrying")
+			p.mu.Lock()
+			auth := p.authState()
+			auth.ExpiresAt = 1
+			p.mu.Unlock()
+			if err := p.EnsureAuthenticated(ctx); err != nil {
+				if errors.Is(err, errRefreshUnrecoverable) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_, _ = w.Write([]byte(`{"error":{"message":"Codex authentication is broken. Re-authenticate with 'auth codex' and restart the service.","type":"authentication_error","code":"provider_auth_broken"}}`))
+					return nil
+				}
+				log.Printf("[codex] 401-triggered refresh failed (transient): %v — returning 401 to client", err)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":{"message":"upstream authentication failed and token refresh failed","type":"authentication_error","code":"unauthorized"}}`))
+				return nil
+			}
+			log.Printf("[codex] token refreshed after 401, retrying upstream call")
+			continue
+		}
+
+		if resp.StatusCode == http.StatusUnauthorized && retriedOn401 {
+			log.Printf("[codex] upstream 401 persists after token refresh — passing through to client")
+			p.cb.onFailure()
+			return handleResponsesAPIResponse(w, resp, streaming, chatgpt, includeUsage)
+		}
+
+		isLimit, limitReason := isAccountLimitSignal(resp)
+		if isLimit && maxAttempts > 1 {
+			log.Printf("[codex] account limit signal (%s) — advancing to next account", limitReason)
+			resp.Body.Close()
+			lastResp = resp
+			p.mu.Lock()
+			advanced := p.advanceCodexAccount()
+			p.mu.Unlock()
+			if !advanced {
+				log.Printf("[codex] all accounts exhausted")
+				break
+			}
+			continue
+		}
+
+		if resp.StatusCode < 500 {
+			p.cb.onSuccess()
+		} else {
+			log.Printf("[codex] upstream 5xx error — circuit breaker failure")
+			p.cb.onFailure()
+		}
+
+		return handleResponsesAPIResponse(w, resp, streaming, chatgpt, includeUsage)
+	}
+
+	if lastResp != nil {
+		log.Printf("[codex] all accounts exhausted, forwarding last %d response", lastResp.StatusCode)
+		w.WriteHeader(lastResp.StatusCode)
+		return nil
+	}
+	return fmt.Errorf("codex: all accounts exhausted with no upstream response")
 }
 
 // Health returns the provider's authentication state.

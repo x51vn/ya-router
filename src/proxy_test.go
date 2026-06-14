@@ -55,6 +55,301 @@ func TestProcessProxyRequest_ChatUsesCopilotFreePathBeforeRouter(t *testing.T) {
 	}
 }
 
+func TestProcessProxyRequest_ChatSkipsFreeRotationForPrefixedModel(t *testing.T) {
+	registry := NewProviderRegistry()
+
+	var freeCalled bool
+	registry.Register(&mockProvider{
+		id:     ProviderCopilot,
+		name:   "Mock Copilot",
+		caps:   []Capability{CapabilityChat},
+		health: ProviderHealth{Authenticated: true},
+		freeChatProxyFunc: func(context.Context, http.ResponseWriter, *http.Request, []byte, string) error {
+			freeCalled = true
+			return nil
+		},
+	})
+
+	var codexCalled bool
+	registry.Register(&mockProvider{
+		id:     ProviderCodex,
+		name:   "Mock Codex",
+		caps:   []Capability{CapabilityChat},
+		health: ProviderHealth{Authenticated: true},
+		models: &ModelList{Object: "list", Data: []Model{{ID: "gpt-5.4", Object: "model"}}},
+		proxyFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request, body []byte, _ Capability) error {
+			codexCalled = true
+			if got := extractModelFromBody(body); got != "gpt-5.4" {
+				t.Fatalf("proxy body model = %q, want gpt-5.4", got)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return nil
+		},
+	})
+
+	cfg := defaultConfig()
+	cfg.Routing.DefaultProvider = string(ProviderCodex)
+	router := NewModelRouter(registry, cfg.Routing)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", io.NopCloser(strings.NewReader(`{"model":"oc-gpt-5.4","messages":[{"role":"user","content":"hi"}]}`)))
+	rr := httptest.NewRecorder()
+
+	if err := processProxyRequest(registry, router, cfg, rr, req, context.Background()); err != nil {
+		t.Fatalf("processProxyRequest: %v", err)
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if freeCalled {
+		t.Fatal("free rotation should not run for explicit provider-prefixed model")
+	}
+	if !codexCalled {
+		t.Fatal("expected normal Codex routing path to run")
+	}
+}
+
+func TestProcessProxyRequest_ResponsesSkipsUnrelatedShortcutForPrefixedModel(t *testing.T) {
+	registry := NewProviderRegistry()
+
+	var copilotResponsesCalled bool
+	registry.Register(&mockProvider{
+		id:     ProviderCopilot,
+		name:   "Mock Copilot",
+		caps:   []Capability{CapabilityChat, CapabilityResponses},
+		health: ProviderHealth{Authenticated: true},
+		responsesProxyFunc: func(context.Context, http.ResponseWriter, *http.Request, []byte, string) error {
+			copilotResponsesCalled = true
+			return nil
+		},
+	})
+
+	var codexResponsesCalled bool
+	registry.Register(&mockProvider{
+		id:     ProviderCodex,
+		name:   "Mock Codex",
+		caps:   []Capability{CapabilityChat, CapabilityResponses},
+		health: ProviderHealth{Authenticated: true},
+		models: &ModelList{Object: "list", Data: []Model{{ID: "gpt-5.4", Object: "model"}}},
+		responsesProxyFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request, body []byte, _ string) error {
+			codexResponsesCalled = true
+			if got := extractModelFromBody(body); got != "gpt-5.4" {
+				t.Fatalf("responses body model = %q, want gpt-5.4", got)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"resp_1","object":"response","model":"gpt-5.4","output":[]}`))
+			return nil
+		},
+	})
+
+	cfg := defaultConfig()
+	cfg.Routing.DefaultProvider = string(ProviderCodex)
+	router := NewModelRouter(registry, cfg.Routing)
+
+	req := httptest.NewRequest("POST", "/v1/responses", io.NopCloser(strings.NewReader(`{"model":"oc-gpt-5.4","input":"hi"}`)))
+	rr := httptest.NewRecorder()
+
+	if err := processProxyRequest(registry, router, cfg, rr, req, context.Background()); err != nil {
+		t.Fatalf("processProxyRequest: %v", err)
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if copilotResponsesCalled {
+		t.Fatal("responses request should not be hijacked by unrelated provider shortcut")
+	}
+	if !codexResponsesCalled {
+		t.Fatal("expected explicit prefixed responses request to route to Codex")
+	}
+}
+
+func TestProcessProxyRequest_ResponsesRejectsUnsupportedFields(t *testing.T) {
+	registry := NewProviderRegistry()
+	router := NewModelRouter(registry, defaultConfig().Routing)
+	req := httptest.NewRequest("POST", "/v1/responses", io.NopCloser(strings.NewReader(`{"model":"gpt-5.4","input":"hi","previous_response_id":"resp_old"}`)))
+	rr := httptest.NewRecorder()
+
+	if err := processProxyRequest(registry, router, defaultConfig(), rr, req, context.Background()); err != nil {
+		t.Fatalf("processProxyRequest: %v", err)
+	}
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "previous_response_id") {
+		t.Fatalf("response body = %q, want unsupported field message", rr.Body.String())
+	}
+}
+
+func TestProcessProxyRequest_ResponsesAllowsReasoningForCodex(t *testing.T) {
+	registry := NewProviderRegistry()
+	registry.Register(&mockProvider{
+		id:     ProviderCodex,
+		name:   "Mock Codex",
+		caps:   []Capability{CapabilityChat},
+		health: ProviderHealth{Authenticated: true},
+		models: &ModelList{Object: "list", Data: []Model{{ID: "gpt-5.4", Object: "model"}}},
+		proxyFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request, body []byte, _ Capability) error {
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal(body, &raw); err != nil {
+				t.Fatalf("unmarshal body: %v", err)
+			}
+			var gotReasoning map[string]interface{}
+			if err := json.Unmarshal(raw["reasoning"], &gotReasoning); err != nil {
+				t.Fatalf("unmarshal reasoning: %v", err)
+			}
+			if gotReasoning["effort"] != "medium" {
+				t.Fatalf("reasoning.effort = %#v, want medium", gotReasoning["effort"])
+			}
+			if _, ok := gotReasoning["summary"]; ok {
+				t.Fatal("reasoning.summary should be stripped in compat chat body")
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","created":1700000000,"model":"gpt-5.4","choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+			return nil
+		},
+	})
+
+	cfg := defaultConfig()
+	cfg.Routing.DefaultProvider = string(ProviderCodex)
+	cfg.Routing.ModelMap = map[string]ModelMapEntry{
+		"oc-gpt-5.4": {Provider: string(ProviderCodex), UpstreamModel: "gpt-5.4"},
+	}
+	router := NewModelRouter(registry, cfg.Routing)
+	req := httptest.NewRequest("POST", "/v1/responses", io.NopCloser(strings.NewReader(`{"model":"oc-gpt-5.4","input":"hi","reasoning":{"effort":"medium","summary":"auto"}}`)))
+	rr := httptest.NewRecorder()
+
+	if err := processProxyRequest(registry, router, cfg, rr, req, context.Background()); err != nil {
+		t.Fatalf("processProxyRequest: %v", err)
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+}
+
+func TestProcessProxyRequest_ResponsesNativeCodexForcesStoreFalse(t *testing.T) {
+	registry := NewProviderRegistry()
+	registry.Register(&mockProvider{
+		id:     ProviderCodex,
+		name:   "Mock Codex",
+		caps:   []Capability{CapabilityChat, CapabilityResponses},
+		health: ProviderHealth{Authenticated: true},
+		models: &ModelList{Object: "list", Data: []Model{{ID: "gpt-5.4", Object: "model"}}},
+		responsesProxyFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request, body []byte, _ string) error {
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal(body, &raw); err != nil {
+				t.Fatalf("unmarshal body: %v", err)
+			}
+			var store bool
+			if err := json.Unmarshal(raw["store"], &store); err != nil {
+				t.Fatalf("unmarshal store: %v", err)
+			}
+			if store {
+				t.Fatal("store = true, want false")
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"resp_1","object":"response","model":"gpt-5.4","output":[]}`))
+			return nil
+		},
+	})
+
+	cfg := defaultConfig()
+	cfg.Routing.DefaultProvider = string(ProviderCodex)
+	cfg.Routing.ModelMap = map[string]ModelMapEntry{
+		"oc-gpt-5.4": {Provider: string(ProviderCodex), UpstreamModel: "gpt-5.4"},
+	}
+	router := NewModelRouter(registry, cfg.Routing)
+	req := httptest.NewRequest("POST", "/v1/responses", io.NopCloser(strings.NewReader(`{"model":"oc-gpt-5.4","input":"hi","store":true}`)))
+	rr := httptest.NewRecorder()
+
+	if err := processProxyRequest(registry, router, cfg, rr, req, context.Background()); err != nil {
+		t.Fatalf("processProxyRequest: %v", err)
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+}
+
+func TestProcessProxyRequest_ResponsesNativeCodexStripsReasoningSummaryOnly(t *testing.T) {
+	registry := NewProviderRegistry()
+	registry.Register(&mockProvider{
+		id:     ProviderCodex,
+		name:   "Mock Codex",
+		caps:   []Capability{CapabilityChat, CapabilityResponses},
+		health: ProviderHealth{Authenticated: true},
+		models: &ModelList{Object: "list", Data: []Model{{ID: "gpt-5.4", Object: "model"}}},
+		responsesProxyFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request, body []byte, _ string) error {
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal(body, &raw); err != nil {
+				t.Fatalf("unmarshal body: %v", err)
+			}
+			if _, ok := raw["reasoningSummary"]; ok {
+				t.Fatal("reasoningSummary should be stripped for native Codex responses requests")
+			}
+			if _, ok := raw["reasoning"]; !ok {
+				t.Fatal("reasoning should be preserved for native Codex responses requests")
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"resp_1","object":"response","model":"gpt-5.4","output":[]}`))
+			return nil
+		},
+	})
+
+	cfg := defaultConfig()
+	cfg.Routing.DefaultProvider = string(ProviderCodex)
+	cfg.Routing.ModelMap = map[string]ModelMapEntry{
+		"oc-gpt-5.4": {Provider: string(ProviderCodex), UpstreamModel: "gpt-5.4"},
+	}
+	router := NewModelRouter(registry, cfg.Routing)
+	req := httptest.NewRequest("POST", "/v1/responses", io.NopCloser(strings.NewReader(`{"model":"oc-gpt-5.4","input":"hi","reasoning":{"effort":"medium"},"reasoningSummary":"auto"}`)))
+	rr := httptest.NewRecorder()
+
+	if err := processProxyRequest(registry, router, cfg, rr, req, context.Background()); err != nil {
+		t.Fatalf("processProxyRequest: %v", err)
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+}
+
+func TestProcessProxyRequest_ResponsesStripsReasoningForNonCodexFallback(t *testing.T) {
+	registry := NewProviderRegistry()
+	registry.Register(&mockProvider{
+		id:     ProviderCopilot,
+		name:   "Mock Copilot",
+		caps:   []Capability{CapabilityChat},
+		health: ProviderHealth{Authenticated: true},
+		models: &ModelList{Object: "list", Data: []Model{{ID: "claude-sonnet-4-6", Object: "model"}}},
+		proxyFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request, body []byte, _ Capability) error {
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal(body, &raw); err != nil {
+				t.Fatalf("unmarshal body: %v", err)
+			}
+			if _, ok := raw["reasoning"]; ok {
+				t.Fatal("reasoning should be stripped for non-Codex providers")
+			}
+			if _, ok := raw["reasoningSummary"]; ok {
+				t.Fatal("reasoningSummary should be stripped for non-Codex providers")
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","created":1700000000,"model":"claude-sonnet-4-6","choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+			return nil
+		},
+	})
+
+	cfg := defaultConfig()
+	cfg.Routing.DefaultProvider = string(ProviderCopilot)
+	router := NewModelRouter(registry, cfg.Routing)
+	req := httptest.NewRequest("POST", "/v1/responses", io.NopCloser(strings.NewReader(`{"model":"claude-sonnet-4-6","input":"hi","reasoning":{"effort":"low"}}`)))
+	rr := httptest.NewRecorder()
+
+	if err := processProxyRequest(registry, router, cfg, rr, req, context.Background()); err != nil {
+		t.Fatalf("processProxyRequest: %v", err)
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+}
+
 func TestCopilotProvider_ProxyFreeChatRequest_RotatesAndIgnoresClientModel(t *testing.T) {
 	provider := NewCopilotProvider(defaultConfig())
 	provider.freeModelResolver = func(context.Context) ([]Model, error) {
@@ -584,6 +879,7 @@ func TestCapabilityFromPath(t *testing.T) {
 	}{
 		{"/v1/chat/completions", CapabilityChat, false},
 		{"/v1/chat/completions/", CapabilityChat, false},
+		{"/v1/responses", CapabilityResponses, false},
 		{"/v1/embeddings", CapabilityEmbeddings, false},
 		{"/v1/unknown", "", true},
 	}

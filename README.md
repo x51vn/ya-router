@@ -378,6 +378,47 @@ make vet
 make test
 ```
 
+## Local Release
+
+Run the full local release cycle (Go build → Docker build → Docker push → git commit → git push):
+
+```bash
+# Required env vars
+export DOCKER_REGISTRY_HOST=docker.x51.vn
+export DOCKER_REGISTRY_USER=<your-username>
+export DOCKER_REGISTRY_PASSWORD=<your-password>
+
+make release
+```
+
+Override the version tag (default: `YYYYMMDD-local`):
+
+```bash
+VERSION=v2.1.0 make release
+```
+
+Dry-run (prints every command, skips all destructive operations):
+
+```bash
+DRY_RUN=1 make release
+```
+
+Composable sub-targets:
+
+```bash
+make docker-build          # build Docker image only
+make docker-push           # push image to registry (requires env vars)
+make git-commit-push       # commit all changes and push to git
+```
+
+Alternatively, use the wrapper script directly:
+
+```bash
+./scripts/release.sh
+DRY_RUN=1 ./scripts/release.sh
+VERSION=v2.1.0 ./scripts/release.sh
+```
+
 ## License
 
 Apache License 2.0. See `LICENSE`.

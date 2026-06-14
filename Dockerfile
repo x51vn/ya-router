@@ -29,6 +29,10 @@ COPY --from=build /out/github-copilot-svcs /app/github-copilot-svcs
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod 0755 /app/entrypoint.sh
 
+# Fixed CODEX_HOME so both `docker exec` (root) and the service (appuser) use the same path
+ENV CODEX_HOME=/app/.codex
+RUN mkdir -p /app/.codex && chown appuser:appuser /app/.codex && chmod 0700 /app/.codex
+
 USER root
 
 EXPOSE 7071

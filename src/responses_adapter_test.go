@@ -624,6 +624,182 @@ func TestResponsesToChatCompletion_Error(t *testing.T) {
 	}
 }
 
+func TestBuildChatCompletionsRequestFromResponses_Basic(t *testing.T) {
+	input := `{
+		"model": "gpt-5.4",
+		"instructions": "Be concise.",
+		"input": [
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"Hello"}]}
+		],
+		"stream": true,
+		"max_output_tokens": 123
+	}`
+
+	out, streaming, err := buildChatCompletionsRequestFromResponses([]byte(input))
+	if err != nil {
+		t.Fatalf("buildChatCompletionsRequestFromResponses: %v", err)
+	}
+	if !streaming {
+		t.Fatal("streaming = false, want true")
+	}
+
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatalf("unmarshal output: %v", err)
+	}
+	if got := string(m["model"]); got != `"gpt-5.4"` {
+		t.Fatalf("model = %s, want \"gpt-5.4\"", got)
+	}
+	var messages []map[string]json.RawMessage
+	if err := json.Unmarshal(m["messages"], &messages); err != nil {
+		t.Fatalf("unmarshal messages: %v", err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("messages len = %d, want 2", len(messages))
+	}
+	var systemRole string
+	_ = json.Unmarshal(messages[0]["role"], &systemRole)
+	if systemRole != "system" {
+		t.Fatalf("messages[0].role = %q, want system", systemRole)
+	}
+	var userRole string
+	_ = json.Unmarshal(messages[1]["role"], &userRole)
+	if userRole != "user" {
+		t.Fatalf("messages[1].role = %q, want user", userRole)
+	}
+}
+
+func TestBuildChatCompletionsRequestFromResponses_RejectsUnsupportedInputItem(t *testing.T) {
+	_, _, err := buildChatCompletionsRequestFromResponses([]byte(`{"model":"gpt-5.4","input":[{"type":"computer_call"}]}`))
+	if err == nil {
+		t.Fatal("expected error for unsupported input item")
+	}
+}
+
+func TestBuildChatCompletionsRequestFromResponses_ReasoningEffortOnly(t *testing.T) {
+	out, _, err := buildChatCompletionsRequestFromResponses([]byte(`{"model":"gpt-5.4","input":"hi","reasoning":{"effort":"high","summary":"detailed"}}`))
+	if err != nil {
+		t.Fatalf("buildChatCompletionsRequestFromResponses: %v", err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatalf("unmarshal output: %v", err)
+	}
+	var reasoning map[string]interface{}
+	if err := json.Unmarshal(m["reasoning"], &reasoning); err != nil {
+		t.Fatalf("unmarshal reasoning: %v", err)
+	}
+	if reasoning["effort"] != "high" {
+		t.Fatalf("reasoning.effort = %#v, want high", reasoning["effort"])
+	}
+	if _, ok := reasoning["summary"]; ok {
+		t.Fatal("reasoning.summary should not be forwarded")
+	}
+}
+
+func TestBuildChatGPTCodexRequestFromResponses_EnforcesStoreFalseWhenOmitted(t *testing.T) {
+	out, streaming, err := buildChatGPTCodexRequestFromResponses([]byte(`{"model":"gpt-5.4","input":"hi"}`))
+	if err != nil {
+		t.Fatalf("buildChatGPTCodexRequestFromResponses: %v", err)
+	}
+	if streaming {
+		t.Fatal("streaming = true, want false")
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(out, &raw); err != nil {
+		t.Fatalf("unmarshal output: %v", err)
+	}
+	var store bool
+	if err := json.Unmarshal(raw["store"], &store); err != nil {
+		t.Fatalf("unmarshal store: %v", err)
+	}
+	if store {
+		t.Fatal("store = true, want false")
+	}
+}
+
+func TestBuildChatGPTCodexRequestFromResponses_OverridesStoreTrue(t *testing.T) {
+	out, streaming, err := buildChatGPTCodexRequestFromResponses([]byte(`{"model":"gpt-5.4","input":"hi","stream":true,"store":true}`))
+	if err != nil {
+		t.Fatalf("buildChatGPTCodexRequestFromResponses: %v", err)
+	}
+	if !streaming {
+		t.Fatal("streaming = false, want true")
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(out, &raw); err != nil {
+		t.Fatalf("unmarshal output: %v", err)
+	}
+	var store bool
+	if err := json.Unmarshal(raw["store"], &store); err != nil {
+		t.Fatalf("unmarshal store: %v", err)
+	}
+	if store {
+		t.Fatal("store = true, want false")
+	}
+}
+
+func TestChatCompletionToResponses_Basic(t *testing.T) {
+	chat := `{
+		"id":"chatcmpl_1",
+		"object":"chat.completion",
+		"created":1700000000,
+		"model":"gpt-5.4",
+		"choices":[{"index":0,"message":{"role":"assistant","content":"Hello there"},"finish_reason":"stop"}],
+		"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}
+	}`
+	out, err := chatCompletionToResponses([]byte(chat))
+	if err != nil {
+		t.Fatalf("chatCompletionToResponses: %v", err)
+	}
+	var resp struct {
+		Object string `json:"object"`
+		Model  string `json:"model"`
+		Output []struct {
+			Type    string `json:"type"`
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp.Object != "response" {
+		t.Fatalf("object = %q, want response", resp.Object)
+	}
+	if resp.Model != "gpt-5.4" {
+		t.Fatalf("model = %q, want gpt-5.4", resp.Model)
+	}
+	if len(resp.Output) != 1 || resp.Output[0].Type != "message" {
+		t.Fatalf("unexpected output = %+v", resp.Output)
+	}
+	if len(resp.Output[0].Content) != 1 || resp.Output[0].Content[0].Type != "output_text" {
+		t.Fatalf("unexpected output content = %+v", resp.Output[0].Content)
+	}
+}
+
+func TestChatCompletionStreamToResponses_Basic(t *testing.T) {
+	chatSSE := "data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-5.4\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n" +
+		"data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-5.4\",\"choices\":[{\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n" +
+		"data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-5.4\",\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n" +
+		"data: [DONE]\n\n"
+	out := string(chatCompletionStreamToResponses([]byte(chatSSE)))
+	if !strings.Contains(out, "event: response.created") {
+		t.Fatalf("missing response.created event: %s", out)
+	}
+	if !strings.Contains(out, "event: response.output_text.delta") {
+		t.Fatalf("missing response.output_text.delta event: %s", out)
+	}
+	if !strings.Contains(out, "event: response.completed") {
+		t.Fatalf("missing response.completed event: %s", out)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // isStreamingRequest
 // ---------------------------------------------------------------------------

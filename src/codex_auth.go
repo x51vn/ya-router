@@ -19,7 +19,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -30,6 +32,36 @@ const (
 	codexCredentialSourceProxyConfig   = "proxy config fallback"
 )
 
+// errRefreshUnrecoverable is returned by codexRefreshToken when the server
+// responds with a permanent, non-retryable OAuth error (e.g. refresh_token_reused,
+// invalid_grant). Callers can use errors.Is to distinguish this from transient
+// failures that may resolve on retry.
+var errRefreshUnrecoverable = errors.New("unrecoverable refresh error")
+
+// unrecoverableRefreshCodes lists OAuth error codes that indicate the refresh
+// token is permanently invalid and retrying will never succeed.
+// Matches the official openai/codex classify_refresh_token_failure mapping.
+var unrecoverableRefreshCodes = map[string]bool{
+	"refresh_token_reused":      true,
+	"refresh_token_expired":     true,
+	"refresh_token_invalidated": true,
+	"invalid_grant":             true,
+}
+
+// isUnrecoverableRefreshError parses a JSON OAuth error body and returns true
+// when the "code" field matches a known-permanent failure.
+func isUnrecoverableRefreshError(body []byte) bool {
+	var envelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return false
+	}
+	return unrecoverableRefreshCodes[envelope.Error.Code]
+}
+
 type resolvedCodexChatGPTAuth struct {
 	AccessToken  string
 	RefreshToken string
@@ -38,8 +70,11 @@ type resolvedCodexChatGPTAuth struct {
 	Source       string
 }
 
+// codexAuthIssuer is the base URL for OpenAI auth endpoints.
+// Declared as a var so tests can override it to point at a local httptest server.
+var codexAuthIssuer = "https://auth.openai.com"
+
 const (
-	codexAuthIssuer    = "https://auth.openai.com"
 	codexOAuthClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
 	codexUserAgent     = "github-copilot-svcs/1.0"
 )
@@ -290,10 +325,41 @@ func parseInt(s string) (int, error) {
 
 // codexRefreshToken uses the stored refresh_token to obtain a new
 // access_token. Retries with exponential backoff.
+//
+// Reload-before-refresh guard: reads ~/.codex/auth.json before the HTTP call.
+// If the official store already holds a fresh token (rotated by another process
+// such as the official Codex CLI), we adopt that token and skip the HTTP POST.
+// If the on-disk refresh token differs from ours, we use the on-disk value so
+// we don't present a stale, already-consumed token to the OAuth server.
 func codexRefreshToken(auth *CodexAuthState, save func() error) error {
 	if auth.RefreshToken == "" {
 		return errors.New("no refresh token available for Codex")
 	}
+
+	// Reload-before-refresh guard: adopt on-disk credentials when the official
+	// Codex store was updated by another process since our last load.
+	if disk, err := loadOfficialCodexAuth(); err == nil && disk != nil {
+		now := time.Now().Unix()
+		if disk.AccessToken != "" && disk.ExpiresAt > now+300 {
+			// On-disk token is fresh — no HTTP call needed.
+			auth.AccessToken = disk.AccessToken
+			auth.RefreshToken = disk.RefreshToken
+			auth.ExpiresAt = disk.ExpiresAt
+			if disk.AccountID != "" {
+				auth.AccountID = disk.AccountID
+			}
+			log.Printf("[codex] reload-before-refresh: adopted fresh token from official store (expires in %ds)", disk.ExpiresAt-now)
+			return save()
+		}
+		if disk.RefreshToken != "" && disk.RefreshToken != auth.RefreshToken {
+			// On-disk refresh token is different (rotated by another process);
+			// use it instead of our stale in-memory token.
+			log.Printf("[codex] reload-before-refresh: using updated refresh token from official store")
+			auth.RefreshToken = disk.RefreshToken
+		}
+	}
+	// If loadOfficialCodexAuth returns an error or nil, proceed with in-memory token (non-fatal).
+
 	for attempt := 1; attempt <= maxRefreshRetries; attempt++ {
 		log.Printf("Refreshing Codex token (attempt %d/%d)",
 			attempt, maxRefreshRetries)
@@ -331,6 +397,10 @@ func codexRefreshToken(auth *CodexAuthState, save func() error) error {
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			errMsg := string(body)
+			if isUnrecoverableRefreshError(body) {
+				return fmt.Errorf("refresh error (status %d): %s: %w",
+					resp.StatusCode, errMsg, errRefreshUnrecoverable)
+			}
 			if attempt == maxRefreshRetries {
 				return fmt.Errorf("refresh error (status %d): %s",
 					resp.StatusCode, errMsg)
@@ -500,6 +570,53 @@ func officialAuthJSONPath() (string, error) {
 	return filepath.Join(ch, "auth.json"), nil
 }
 
+// officialModelsCachePath returns the path to the official models_cache.json.
+func officialModelsCachePath() (string, error) {
+	ch, err := codexHomePath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(ch, "models_cache.json"), nil
+}
+
+// loadOfficialCodexModels reads the Codex CLI cache and returns supported
+// public model IDs. This avoids relying on the hardcoded fallback list.
+func loadOfficialCodexModels() ([]Model, error) {
+	path, err := officialModelsCachePath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+
+	var payload struct {
+		Models []struct {
+			Slug           string `json:"slug"`
+			SupportedInAPI bool   `json:"supported_in_api"`
+			Visibility     string `json:"visibility"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+
+	seen := make(map[string]bool)
+	models := make([]Model, 0, len(payload.Models))
+	for _, item := range payload.Models {
+		if item.Slug == "" || !item.SupportedInAPI || item.Visibility == "hide" || seen[item.Slug] {
+			continue
+		}
+		seen[item.Slug] = true
+		models = append(models, Model{ID: item.Slug, Object: "model", OwnedBy: "openai"})
+	}
+	return models, nil
+}
+
 // loadOfficialCodexAuth reads the official Codex auth store and
 // populates a CodexAuthState.  Returns nil, nil if no auth.json exists.
 func loadOfficialCodexAuth() (*CodexAuthState, error) {
@@ -624,5 +741,23 @@ func persistToOfficialStore(auth *CodexAuthState) error {
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	// If running as root (e.g. docker exec), chown the file to the service user
+	// so the non-root service process can read it.
+	if os.Getuid() == 0 {
+		chownToServiceUser(path)
+	}
+	return nil
+}
+
+func chownToServiceUser(path string) {
+	u, err := user.Lookup("appuser")
+	if err != nil {
+		return
+	}
+	uid, _ := strconv.Atoi(u.Uid)
+	gid, _ := strconv.Atoi(u.Gid)
+	_ = os.Chown(path, uid, gid)
 }
