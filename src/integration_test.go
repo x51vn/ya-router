@@ -1,9 +1,11 @@
-package main
+package yarouter
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -81,9 +83,8 @@ func TestModelsEndpointConsistency(t *testing.T) {
 		ids[m.ID] = true
 	}
 
-	// Models from Copilot are prefixed gc-.
-	if !ids["gc-gpt-5-mini"] {
-		t.Errorf("gc-gpt-5-mini not in response; got %v", ids)
+	if !ids["github/gpt-5-mini"] {
+		t.Errorf("github/gpt-5-mini not in response; got %v", ids)
 	}
 }
 
@@ -133,9 +134,8 @@ func TestModelsEndpointAggregatesMultipleProviders(t *testing.T) {
 		ids[m.ID] = true
 	}
 
-	// Models are now prefixed: Copilot→gc-, Codex→oc-.
-	if !ids["gc-gpt-4"] || !ids["oc-o3-mini"] {
-		t.Errorf("expected both gc-gpt-4 and oc-o3-mini (prefixed), got %v", ids)
+	if !ids["github/gpt-4"] || !ids["codex/o3-mini"] {
+		t.Errorf("expected both github/gpt-4 and codex/o3-mini (prefixed), got %v", ids)
 	}
 }
 
@@ -459,7 +459,7 @@ func TestHealthHandler(t *testing.T) {
 	req := httptest.NewRequest("GET", "/healthz", nil)
 	rec := httptest.NewRecorder()
 
-	healthHandler(rec, req)
+	healthHandler(NewProviderRegistry()).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -470,6 +470,29 @@ func TestHealthHandler(t *testing.T) {
 
 	if resp["status"] != "ok" {
 		t.Errorf("health status = %q, want ok", resp["status"])
+	}
+}
+
+func TestHealthHandlersUseIsolatedRegistries(t *testing.T) {
+	readyRegistry := NewProviderRegistry()
+	readyRegistry.Register(&mockProvider{
+		id:     ProviderCopilot,
+		name:   "Copilot",
+		health: ProviderHealth{Authenticated: true},
+	})
+	emptyRegistry := NewProviderRegistry()
+
+	request := httptest.NewRequest("GET", "/health/ready", nil)
+	readyResponse := httptest.NewRecorder()
+	healthHandler(readyRegistry).ServeHTTP(readyResponse, request)
+	if readyResponse.Code != http.StatusOK {
+		t.Fatalf("ready registry status=%d", readyResponse.Code)
+	}
+
+	emptyResponse := httptest.NewRecorder()
+	healthHandler(emptyRegistry).ServeHTTP(emptyResponse, request)
+	if emptyResponse.Code != http.StatusServiceUnavailable {
+		t.Fatalf("empty registry status=%d", emptyResponse.Code)
 	}
 }
 
@@ -508,44 +531,6 @@ func TestNormalizeCopilotAccounts_SkipsWhenAccountsPresent(t *testing.T) {
 	}
 }
 
-func TestAdvanceAccount_AdvancesToNextHealthyAccount(t *testing.T) {
-	cfg := buildTestConfigWithAccounts(300, 0, 0)
-	p := &CopilotProvider{cfg: cfg}
-
-	advanced := p.advanceAccount()
-	if !advanced {
-		t.Fatal("expected advance to succeed with 2 accounts")
-	}
-	if p.accountCursor != 1 {
-		t.Errorf("cursor = %d, want 1", p.accountCursor)
-	}
-	if cfg.Providers.Copilot.Accounts[0].LastLimitedAt == 0 {
-		t.Error("account 0 LastLimitedAt should be set after advance")
-	}
-}
-
-func TestAdvanceAccount_ReturnsFalseOnSingleAccount(t *testing.T) {
-	cfg := buildTestConfigWithAccounts(300, 0)
-	p := &CopilotProvider{cfg: cfg}
-	if p.advanceAccount() {
-		t.Error("expected false for single-account pool")
-	}
-}
-
-func TestAdvanceAccount_SkipsCooldownAccounts(t *testing.T) {
-	nowish := time.Now().Unix()
-	cfg := buildTestConfigWithAccounts(300, 0, nowish)
-	accounts := cfg.Providers.Copilot.Accounts
-	accounts[1].LastLimitedAt = nowish
-	cfg.Providers.Copilot.Accounts = accounts
-
-	p := &CopilotProvider{cfg: cfg}
-	advanced := p.advanceAccount()
-	if advanced {
-		t.Error("both accounts in cooldown; expected no advance")
-	}
-}
-
 func TestIsAccountLimitSignal_429(t *testing.T) {
 	resp := &http.Response{
 		StatusCode: http.StatusTooManyRequests,
@@ -567,8 +552,8 @@ func TestIsAccountLimitSignal_403WithRateLimit(t *testing.T) {
 	if !ok {
 		t.Error("403 with 'rate limit' body should be account limit signal")
 	}
-	if !strings.Contains(preview, "rate limit") {
-		t.Errorf("expected preview to contain 'rate limit', got %q", preview)
+	if preview != "quota_exhausted" {
+		t.Errorf("expected redacted quota reason, got %q", preview)
 	}
 }
 
@@ -607,71 +592,6 @@ func buildTestConfigWithAccounts(cooldownSecs int, lastLimitedAts ...int64) *Con
 	}
 	cfg.Providers.Copilot.Accounts = accounts
 	return cfg
-}
-
-func TestProxyFreeChatRequest_AccountFailover(t *testing.T) {
-	cfg := buildTestConfigWithAccounts(300, 0, 0)
-
-	p := NewCopilotProvider(cfg)
-	p.freeModelResolver = func(_ context.Context) ([]Model, error) {
-		return []Model{{ID: "gpt-test"}}, nil
-	}
-
-	callCount := 0
-	p.proxyExecutor = func(_ context.Context, _ *http.Request, _ []byte, _ Capability) (*http.Response, string, error) {
-		acc := p.activeAccount()
-		callCount++
-		if acc != nil && acc.Label == "acct-0" {
-			rec := httptest.NewRecorder()
-			rec.WriteHeader(http.StatusTooManyRequests)
-			rec.WriteString(`{"error":"rate limited"}`)
-			return rec.Result(), "", nil
-		}
-		rec := httptest.NewRecorder()
-		rec.WriteHeader(http.StatusOK)
-		rec.WriteString(`{"choices":[]}`)
-		return rec.Result(), "", nil
-	}
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{}`))
-	err := p.ProxyFreeChatRequest(context.Background(), w, req, []byte(`{}`), "gpt-test")
-	if err != nil {
-		t.Fatalf("expected no error after failover, got: %v", err)
-	}
-	if p.accountCursor != 1 {
-		t.Errorf("expected cursor=1 after failover, got %d", p.accountCursor)
-	}
-	if callCount < 2 {
-		t.Errorf("expected at least 2 proxy calls (one per account), got %d", callCount)
-	}
-}
-
-func TestProxyFreeChatRequest_AllAccountsExhausted(t *testing.T) {
-	nowish := time.Now().Unix()
-	cfg := buildTestConfigWithAccounts(300, 0, nowish)
-
-	p := NewCopilotProvider(cfg)
-	p.freeModelResolver = func(_ context.Context) ([]Model, error) {
-		return []Model{{ID: "gpt-test"}}, nil
-	}
-
-	p.proxyExecutor = func(_ context.Context, _ *http.Request, _ []byte, _ Capability) (*http.Response, string, error) {
-		rec := httptest.NewRecorder()
-		rec.WriteHeader(http.StatusTooManyRequests)
-		rec.WriteString(`{"error":"rate limited"}`)
-		return rec.Result(), "", nil
-	}
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{}`))
-	err := p.ProxyFreeChatRequest(context.Background(), w, req, []byte(`{}`), "gpt-test")
-	if err != nil {
-		t.Errorf("expected no error (should forward last 429), got: %v", err)
-	}
-	if w.Code != http.StatusTooManyRequests {
-		t.Errorf("expected forwarded 429, got %d", w.Code)
-	}
 }
 
 func buildTestCodexConfigWithAccounts(cooldownSecs int, modes []string, lastLimitedAts ...int64) *Config {
@@ -747,6 +667,84 @@ func TestAdvanceCodexAccount_ReturnsFalseOnSingleAccount(t *testing.T) {
 	}
 }
 
+func TestAccountFailoverMarksTheAccountThatServedTheRequest(t *testing.T) {
+	codexConfig := buildTestCodexConfigWithAccounts(300, []string{"chatgpt", "chatgpt"}, 0, 0)
+	codex := NewCodexProvider(codexConfig)
+	codex.accountCursor = 1
+	if !codex.advanceCodexAccountFrom(0) {
+		t.Fatal("Codex should retain the already-selected healthy account")
+	}
+	if codexConfig.Providers.Codex.Accounts[0].LastLimitedAt == 0 || codexConfig.Providers.Codex.Accounts[1].LastLimitedAt != 0 {
+		t.Fatalf("Codex cooldowns = %#v", codexConfig.Providers.Codex.Accounts)
+	}
+
+	copilotConfig := defaultConfig()
+	copilotConfig.Providers.Copilot.Accounts = []CopilotAccount{
+		{ID: "one", Label: "one"},
+		{ID: "two", Label: "two"},
+	}
+	copilot := NewCopilotProvider(copilotConfig)
+	copilot.accountCursor = 1
+	if !copilot.advanceAccountFrom(0) {
+		t.Fatal("Copilot should retain the already-selected healthy account")
+	}
+	if copilotConfig.Providers.Copilot.Accounts[0].LastLimitedAt == 0 || copilotConfig.Providers.Copilot.Accounts[1].LastLimitedAt != 0 {
+		t.Fatalf("Copilot cooldowns = %#v", copilotConfig.Providers.Copilot.Accounts)
+	}
+}
+
+func TestCopilotFreeFinalRateLimitResponseBodyIsForwarded(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Providers.Copilot.Accounts = []CopilotAccount{{
+		ID:    "only",
+		Label: "only",
+		Auth: CopilotAuthState{
+			Mode:         "device_code",
+			CopilotToken: "token",
+			ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+		},
+	}}
+	provider := NewCopilotProvider(cfg)
+	provider.freeModelResolver = func(context.Context) ([]Model, error) {
+		return []Model{{ID: "free-model"}}, nil
+	}
+	provider.proxyExecutor = func(context.Context, *http.Request, []byte, Capability) (*http.Response, string, error) {
+		recorder := httptest.NewRecorder()
+		recorder.WriteHeader(http.StatusTooManyRequests)
+		recorder.WriteString(`{"error":{"code":"rate_limited"}}`)
+		return recorder.Result(), "", nil
+	}
+
+	response := httptest.NewRecorder()
+	err := provider.ProxyFreeChatRequest(
+		context.Background(), response,
+		httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil),
+		[]byte(`{"model":"auto-free","messages":[]}`), "auto-free",
+	)
+	if err != nil {
+		t.Fatalf("ProxyFreeChatRequest() error = %v", err)
+	}
+	if response.Code != http.StatusTooManyRequests || !strings.Contains(response.Body.String(), "rate_limited") {
+		t.Fatalf("final response = status %d body %q", response.Code, response.Body.String())
+	}
+}
+
+func TestResponseBodyPreviewIsBoundedAndReplayable(t *testing.T) {
+	original := strings.Repeat("x", 8*1024)
+	response := &http.Response{Body: io.NopCloser(strings.NewReader(original))}
+	preview := readAndResetResponseBody(response)
+	if len(preview) != 4*1024 {
+		t.Fatalf("preview length = %d, want %d", len(preview), 4*1024)
+	}
+	replayed, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(replayed) != original {
+		t.Fatalf("replayed body length = %d, want %d", len(replayed), len(original))
+	}
+}
+
 func TestIsCodexAccountInCooldown(t *testing.T) {
 	nowish := time.Now().Unix()
 	cfg := defaultConfig()
@@ -804,7 +802,7 @@ func TestProxyCodexRequest_AccountFailover(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{}`))
-	err := p.ProxyRequest(context.Background(), w, req, []byte(`{"model":"oc-gpt-5","messages":[]}`), CapabilityChat)
+	err := p.ProxyRequest(context.Background(), w, req, []byte(`{"model":"codex/gpt-5","messages":[]}`), CapabilityChat)
 	if err != nil {
 		t.Fatalf("expected no error after failover, got: %v", err)
 	}
@@ -831,9 +829,10 @@ func TestProxyCodexRequest_AllAccountsExhausted(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{}`))
-	err := p.ProxyRequest(context.Background(), w, req, []byte(`{"model":"oc-gpt-5","messages":[]}`), CapabilityChat)
-	if err != nil {
-		t.Errorf("expected no error (should forward last 429), got: %v", err)
+	err := p.ProxyRequest(context.Background(), w, req, []byte(`{"model":"codex/gpt-5","messages":[]}`), CapabilityChat)
+	var providerErr *ProviderError
+	if err == nil || !errors.As(err, &providerErr) || providerErr.Kind != ProviderErrorRateLimit {
+		t.Errorf("expected typed rate-limit error, got: %v", err)
 	}
 	if w.Code != http.StatusTooManyRequests {
 		t.Errorf("expected forwarded 429, got %d", w.Code)

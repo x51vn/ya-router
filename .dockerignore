@@ -26,5 +26,8 @@ vendor/
 coverage/
 *.out
 
+# Runtime auth/config directories (container mount points, not build artifacts)
+config/
+
 # Local configs
 **/config.json

@@ -1,5 +1,5 @@
 // model_cache_test.go — tests for the TTL-based model cache.
-package main
+package yarouter
 
 import (
 	"errors"

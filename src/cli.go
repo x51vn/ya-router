@@ -1,5 +1,5 @@
 // cli.go — command-line command handlers.
-package main
+package yarouter
 
 import (
 	"context"
@@ -9,209 +9,210 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"time"
+
+	runtimepkg "github.com/duvu/ya-router/internal/runtime"
 )
 
 func printUsage() {
-	fmt.Printf("GitHub Copilot SVCS Proxy\n\n")
+	fmt.Printf("ya-router\n\n")
 	fmt.Printf("Usage: %s [command] [options]\n\n", os.Args[0])
 	fmt.Printf("Commands:\n")
 	fmt.Printf("  run|start             Start the proxy server\n")
 	fmt.Printf("    --config-migrate    Config migration mode: merge (default), none, override\n")
-	fmt.Printf("  auth [copilot|codex]  Authenticate a provider (default: copilot)\n")
+	fmt.Printf("  auth [copilot|codex|kilo] Authenticate or enable a provider (default: copilot)\n")
 	fmt.Printf("    --mode              Auth mode: device_code (default)\n")
 	fmt.Printf("    --account <label>   Account label for multi-account pool\n")
-	fmt.Printf("    --api-key <key>     Use OpenAI Platform API key (codex only)\n")
-	fmt.Printf("    --token <token>     Manually set access token (codex only, fallback)\n")
+	fmt.Printf("    --api-key-stdin     Read a Codex or Kilo API key from stdin\n")
+	fmt.Printf("    --token-stdin       Read a ChatGPT manual token from stdin (recovery only)\n")
 	fmt.Printf("  status                Show authentication status for all providers\n")
 	fmt.Printf("  config                Show current configuration\n")
-	fmt.Printf("  models [--provider P] List models (all providers or a specific one)\n")
+	fmt.Printf("  models [--provider P] [--refresh] List models\n")
 	fmt.Printf("  refresh [--provider P] Force token refresh\n")
 	fmt.Printf("  migrate-config        Migrate configuration file\n")
-	fmt.Printf("    --mode              Migration mode: merge (default), override\n")
 	fmt.Printf("  version               Show version information\n")
 	fmt.Printf("  help                  Show this help\n\n")
+	fmt.Printf("Server environment:\n")
+	fmt.Printf("  YA_ROUTER_LISTEN_ADDRESS         Defaults to 127.0.0.1\n")
+	fmt.Printf("  YA_ROUTER_API_KEY                Required for non-loopback binding\n")
+	fmt.Printf("  YA_ROUTER_CORS_ALLOWED_ORIGINS   Comma-separated origin allowlist\n\n")
+	fmt.Printf("Kilo environment:\n")
+	fmt.Printf("  KILO_API_KEY                     Optional; free models support anonymous access\n")
+	fmt.Printf("  KILO_ORG_ID                      Optional organization context\n")
+	fmt.Printf("  KILO_GATEWAY_BASE_URL            Defaults to https://api.kilo.ai/api/gateway\n\n")
 	flag.PrintDefaults()
 }
 
-// handleAuthCopilot runs the GitHub device-flow for Copilot.
-// mode is ignored for Copilot (always device_code) but accepted for CLI consistency.
-// accountLabel selects which pool entry to authenticate; empty = first account.
-func handleAuthCopilot(mode, accountLabel string) error {
+func handleAuthCopilot(_ string, accountLabel string) error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 	initializeTimeouts(cfg)
 	cfg.Providers.Copilot.Enabled = true
-
-	auth, label, saveErr := resolveOrCreateCopilotAccount(cfg, accountLabel)
-	if saveErr != nil {
-		return saveErr
+	auth, label, err := resolveOrCreateCopilotAccount(cfg, accountLabel)
+	if err != nil {
+		return err
 	}
-
 	fmt.Printf("Starting GitHub Copilot authentication (account: %s, mode: device_code)...\n", label)
 	if err := copilotAuthenticate(auth, func() error { return saveConfig(cfg) }); err != nil {
 		return fmt.Errorf("authentication failed: %w", err)
 	}
-	fmt.Println("Authentication successful!")
+	fmt.Println("Authentication successful.")
 	return nil
 }
 
-// resolveOrCreateCopilotAccount returns a pointer into cfg's account pool for the
-// given label. If label is empty the first account is used. If no matching
-// account exists a new one is appended and the config is saved.
 func resolveOrCreateCopilotAccount(cfg *Config, label string) (*CopilotAuthState, string, error) {
 	accounts := &cfg.Providers.Copilot.Accounts
-
 	if label == "" {
 		if len(*accounts) == 0 {
-			*accounts = append(*accounts, CopilotAccount{Label: "primary"})
+			*accounts = append(*accounts, CopilotAccount{ID: stableAccountID("copilot", "primary"), Label: "primary"})
 		}
 		label = (*accounts)[0].Label
 		return &(*accounts)[0].Auth, label, nil
 	}
-
 	for i := range *accounts {
 		if (*accounts)[i].Label == label {
 			return &(*accounts)[i].Auth, label, nil
 		}
 	}
-
-	*accounts = append(*accounts, CopilotAccount{Label: label})
-	idx := len(*accounts) - 1
+	*accounts = append(*accounts, CopilotAccount{ID: stableAccountID("copilot", label), Label: label})
+	index := len(*accounts) - 1
 	if err := saveConfig(cfg); err != nil {
 		return nil, "", fmt.Errorf("failed to add account %q: %w", label, err)
 	}
-	return &(*accounts)[idx].Auth, label, nil
+	return &(*accounts)[index].Auth, label, nil
 }
 
-// handleAuthCodex runs the OpenAI OAuth device-code flow for Codex and persists
-// ChatGPT-backed credentials to the official Codex auth store.
+// handleAuthCodex stores credentials in ya-router's 0600 config. The official
+// Codex store remains read-only import data.
 func handleAuthCodex(accountLabel string) error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 	initializeTimeouts(cfg)
-
 	cfg.Providers.Codex.Enabled = true
-
-	authPtr, label, resolveErr := resolveOrCreateCodexAccount(cfg, accountLabel)
-	if resolveErr != nil {
-		return resolveErr
+	authPtr, label, err := resolveOrCreateCodexAccount(cfg, accountLabel)
+	if err != nil {
+		return err
 	}
-	authPtr.Mode = "chatgpt"
-
 	fmt.Printf("Starting OpenAI Codex authentication (account: %s, mode: chatgpt device_code)...\n", label)
-
 	auth := &CodexAuthState{Mode: "chatgpt"}
 	if err := codexAuthenticate(auth, func() error { return nil }); err != nil {
 		return fmt.Errorf("Codex authentication failed: %w", err)
 	}
-
-	if err := persistToOfficialStore(auth); err != nil {
-		fmt.Printf("Warning: could not write to official Codex store: %v\n", err)
-	} else {
-		p, _ := officialAuthJSONPath()
-		fmt.Printf("Tokens also saved to %s\n", p)
-	}
-	authPtr.AccessToken = auth.AccessToken
-	authPtr.RefreshToken = auth.RefreshToken
-	authPtr.ExpiresAt = auth.ExpiresAt
-	authPtr.AccountID = auth.AccountID
+	*authPtr = *auth
 	clearPersistedChatGPTSecrets(&cfg.Providers.Codex.Auth)
 	if err := saveConfig(cfg); err != nil {
-		return fmt.Errorf("failed to persist Codex auth mode: %w", err)
+		return fmt.Errorf("failed to persist Codex credentials: %w", err)
 	}
-
-	fmt.Println("Codex credentials validated successfully!")
+	fmt.Println("Codex credentials stored in ya-router's local credential config.")
 	return nil
 }
 
 func resolveOrCreateCodexAccount(cfg *Config, label string) (*CodexAuthState, string, error) {
 	accounts := &cfg.Providers.Codex.Accounts
-
 	if label == "" {
 		if len(*accounts) == 0 {
-			*accounts = append(*accounts, CodexAccount{Label: "primary"})
+			*accounts = append(*accounts, CodexAccount{ID: stableAccountID("codex", "primary"), Label: "primary"})
 		}
 		label = (*accounts)[0].Label
 		return &(*accounts)[0].Auth, label, nil
 	}
-
 	for i := range *accounts {
 		if (*accounts)[i].Label == label {
 			return &(*accounts)[i].Auth, label, nil
 		}
 	}
-
-	*accounts = append(*accounts, CodexAccount{Label: label})
-	idx := len(*accounts) - 1
+	*accounts = append(*accounts, CodexAccount{ID: stableAccountID("codex", label), Label: label})
+	index := len(*accounts) - 1
 	if err := saveConfig(cfg); err != nil {
-		return nil, "", fmt.Errorf("failed to add codex account %q: %w", label, err)
+		return nil, "", fmt.Errorf("failed to add Codex account %q: %w", label, err)
 	}
-	return &(*accounts)[idx].Auth, label, nil
+	return &(*accounts)[index].Auth, label, nil
 }
 
-// handleAuthCodexAPIKey stores an OpenAI Platform API key for Codex.
 func handleAuthCodexAPIKey(apiKey, accountLabel string) error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 	initializeTimeouts(cfg)
-
 	cfg.Providers.Codex.Enabled = true
-	authPtr, _, resolveErr := resolveOrCreateCodexAccount(cfg, accountLabel)
-	if resolveErr != nil {
-		return resolveErr
+	auth, _, err := resolveOrCreateCodexAccount(cfg, accountLabel)
+	if err != nil {
+		return err
 	}
-	authPtr.Mode = "api_key"
-	authPtr.APIKey = apiKey
-	authPtr.AccessToken = ""
-	authPtr.RefreshToken = ""
-	authPtr.ExpiresAt = 0
-	authPtr.AccountID = ""
-
+	auth.Mode = "api_key"
+	auth.APIKey = apiKey
+	auth.AccessToken = ""
+	auth.RefreshToken = ""
+	auth.ExpiresAt = 0
+	auth.AccountID = ""
 	if err := saveConfig(cfg); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
-	fmt.Println("Codex API key saved (mode: api_key → api.openai.com/v1).")
+	fmt.Println("Codex API-key mode configured for api.openai.com/v1.")
 	return nil
 }
 
-// handleAuthCodexManualToken sets a manually-provided access token.
-// Useful as a fallback for environments where device-code flow fails.
 func handleAuthCodexManualToken(token, accountLabel string) error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 	initializeTimeouts(cfg)
-
 	cfg.Providers.Codex.Enabled = true
-	authPtr, _, resolveErr := resolveOrCreateCodexAccount(cfg, accountLabel)
-	if resolveErr != nil {
-		return resolveErr
+	auth, _, err := resolveOrCreateCodexAccount(cfg, accountLabel)
+	if err != nil {
+		return err
 	}
-	authPtr.Mode = "chatgpt"
-	auth := &CodexAuthState{Mode: "chatgpt", AccessToken: token, ExpiresAt: time.Now().Unix() + 86400}
-	if err := persistToOfficialStore(auth); err != nil {
-		return fmt.Errorf("failed to persist official Codex auth store: %w", err)
+	auth.Mode = "chatgpt"
+	auth.AccessToken = token
+	auth.RefreshToken = ""
+	auth.AccountID = extractAccountIDFromJWT(token)
+	auth.ExpiresAt = extractJWTExpiry(token)
+	if auth.ExpiresAt == 0 {
+		auth.ExpiresAt = time.Now().Unix() + 3600
 	}
-	authPtr.AccessToken = auth.AccessToken
-	authPtr.ExpiresAt = auth.ExpiresAt
 	clearPersistedChatGPTSecrets(&cfg.Providers.Codex.Auth)
-
 	if err := saveConfig(cfg); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
-	fmt.Println("Codex access token saved successfully!")
-	fmt.Println("Note: token expiry is treated as 24h for this manual fallback. Run 'refresh --provider codex' later if needed.")
+	fmt.Println("Codex access token stored in ya-router's local config.")
+	fmt.Println("Manual tokens are not refreshable; device authentication is recommended.")
 	return nil
 }
 
-// handleStatus prints authentication status for each configured provider.
+func handleAuthKiloAnonymous() error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+	cfg.Providers.Kilo.Enabled = true
+	cfg.Providers.Kilo.AllowAnonymous = true
+	if err := saveConfig(cfg); err != nil {
+		return fmt.Errorf("failed to save config: %w", err)
+	}
+	fmt.Println("Kilo Gateway enabled in anonymous mode (free model IDs only).")
+	return nil
+}
+
+func handleAuthKiloAPIKey(apiKey string) error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+	cfg.Providers.Kilo.Enabled = true
+	cfg.Providers.Kilo.AllowAnonymous = true
+	cfg.Providers.Kilo.APIKey = apiKey
+	if err := saveConfig(cfg); err != nil {
+		return fmt.Errorf("failed to save config: %w", err)
+	}
+	fmt.Println("Kilo Gateway API key stored in ya-router's local credential config.")
+	return nil
+}
+
 func handleStatus() error {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -220,205 +221,184 @@ func handleStatus() error {
 	path, _ := getConfigPath()
 	fmt.Printf("Configuration: %s\n", path)
 	fmt.Printf("Port: %d\n\n", cfg.Port)
-
 	if cfg.Providers.Copilot.Enabled {
 		printCopilotStatus(&cfg.Providers.Copilot)
 	}
 	if cfg.Providers.Codex.Enabled {
 		printCodexStatus(cfg)
 	}
+	if cfg.Providers.Kilo.Enabled {
+		printKiloStatus(cfg)
+	}
 	return nil
 }
 
-func printCopilotStatus(pCfg *CopilotProviderConfig) {
+func printCopilotStatus(provider *CopilotProviderConfig) {
 	fmt.Println("Provider: GitHub Copilot")
-	accounts := pCfg.Accounts
+	accounts := provider.Accounts
 	if len(accounts) >= 2 {
-		fmt.Printf("  Account pool: %d accounts (cooldown: %ds)\n",
-			len(accounts), pCfg.AccountCooldownSeconds)
-		for i, acc := range accounts {
-			label := acc.Label
+		fmt.Printf("  Account pool: %d accounts (cooldown: %ds)\n", len(accounts), provider.AccountCooldownSeconds)
+		for i := range accounts {
+			label := accounts[i].Label
 			if label == "" {
 				label = fmt.Sprintf("account-%d", i)
 			}
-			printCopilotAccountLine(i, label, &acc.Auth, acc.LastLimitedAt, pCfg.AccountCooldownSeconds)
+			printCopilotAccountLine(i, label, &accounts[i].Auth, accounts[i].LastLimitedAt, provider.AccountCooldownSeconds)
 		}
 	} else {
-		var auth *CopilotAuthState
+		auth := &provider.Auth
 		if len(accounts) == 1 {
 			auth = &accounts[0].Auth
-		} else {
-			auth = &pCfg.Auth
 		}
 		printCopilotAuthLines(auth)
 	}
 	fmt.Println()
 }
 
-func printCopilotAccountLine(idx int, label string, auth *CopilotAuthState, lastLimitedAt int64, cooldownSecs int) {
+func printCopilotAccountLine(index int, label string, auth *CopilotAuthState, lastLimitedAt int64, cooldownSeconds int) {
 	now := time.Now().Unix()
-	prefix := fmt.Sprintf("  [%d] %s:", idx, label)
-	if lastLimitedAt > 0 {
-		elapsed := now - lastLimitedAt
-		if elapsed < int64(cooldownSecs) {
-			fmt.Printf("%s ⏳ in cooldown (%ds remaining)\n", prefix, int64(cooldownSecs)-elapsed)
-			return
-		}
+	prefix := fmt.Sprintf("  [%d] %s:", index, label)
+	if lastLimitedAt > 0 && now-lastLimitedAt < int64(cooldownSeconds) {
+		fmt.Printf("%s in cooldown (%ds remaining)\n", prefix, int64(cooldownSeconds)-(now-lastLimitedAt))
+		return
 	}
 	if auth.CopilotToken == "" {
-		fmt.Printf("%s ✗ not authenticated\n", prefix)
+		fmt.Printf("%s not authenticated\n", prefix)
 		return
 	}
 	remaining := auth.ExpiresAt - now
 	if remaining > 0 {
-		fmt.Printf("%s ✓ authenticated (expires in %dm %ds)\n", prefix, remaining/60, remaining%60)
+		fmt.Printf("%s authenticated (expires in %dm %ds)\n", prefix, remaining/60, remaining%60)
 	} else {
-		fmt.Printf("%s ⚠ token expired\n", prefix)
+		fmt.Printf("%s token expired\n", prefix)
 	}
 }
 
 func printCopilotAuthLines(auth *CopilotAuthState) {
 	now := time.Now().Unix()
-	if auth.CopilotToken != "" {
-		remaining := auth.ExpiresAt - now
-		if remaining > 0 {
-			fmt.Printf("  Auth: ✓ Authenticated (expires in %dm %ds)\n", remaining/60, remaining%60)
-			threshold := int64(300)
-			if auth.RefreshIn > 0 {
-				if t := auth.RefreshIn / 5; t > threshold {
-					threshold = t
-				}
-			}
-			if remaining <= threshold {
-				fmt.Printf("  Status: ⚠  Refresh imminent\n")
-			} else {
-				fmt.Printf("  Status: ✅ Token healthy\n")
-			}
-		} else {
-			fmt.Printf("  Auth: ⚠  Token EXPIRED (%d s ago)\n", -remaining)
-		}
-		fmt.Printf("  Has GitHub token: %t\n", auth.GitHubToken != "")
-	} else {
-		fmt.Printf("  Auth: ✗ Not authenticated — run '%s auth copilot'\n", os.Args[0])
+	if auth.CopilotToken == "" {
+		fmt.Printf("  Auth: not authenticated — run '%s auth copilot'\n", os.Args[0])
+		return
 	}
+	remaining := auth.ExpiresAt - now
+	if remaining > 0 {
+		fmt.Printf("  Auth: authenticated (expires in %dm %ds)\n", remaining/60, remaining%60)
+	} else {
+		fmt.Printf("  Auth: token expired (%ds ago)\n", -remaining)
+	}
+	fmt.Printf("  Has GitHub token: %t\n", auth.GitHubToken != "")
 }
 
 func printCodexStatus(cfg *Config) {
 	fmt.Println("Provider: OpenAI Codex")
-	pCfg := &cfg.Providers.Codex
-	accounts := pCfg.Accounts
-
+	provider := &cfg.Providers.Codex
+	accounts := provider.Accounts
 	if len(accounts) >= 2 {
-		fmt.Printf("  Account pool: %d accounts (cooldown: %ds)\n",
-			len(accounts), pCfg.AccountCooldownSeconds)
-		for i, acc := range accounts {
-			label := acc.Label
+		fmt.Printf("  Account pool: %d accounts (cooldown: %ds)\n", len(accounts), provider.AccountCooldownSeconds)
+		for i := range accounts {
+			label := accounts[i].Label
 			if label == "" {
 				label = fmt.Sprintf("account-%d", i)
 			}
-			printCodexAccountLine(i, label, &acc.Auth, acc.LastLimitedAt, pCfg.AccountCooldownSeconds)
+			printCodexAccountLine(i, label, &accounts[i].Auth, accounts[i].LastLimitedAt, provider.AccountCooldownSeconds)
 		}
 		fmt.Println()
 		return
 	}
-
-	var auth *CodexAuthState
+	auth := &provider.Auth
 	if len(accounts) == 1 {
 		auth = &accounts[0].Auth
-	} else {
-		auth = &pCfg.Auth
 	}
 	printCodexAuthLines(auth)
 	fmt.Println()
 }
 
-func printCodexAccountLine(idx int, label string, auth *CodexAuthState, lastLimitedAt int64, cooldownSecs int) {
+func printCodexAccountLine(index int, label string, auth *CodexAuthState, lastLimitedAt int64, cooldownSeconds int) {
 	now := time.Now().Unix()
-	prefix := fmt.Sprintf("  [%d] %s:", idx, label)
-	if lastLimitedAt > 0 {
-		elapsed := now - lastLimitedAt
-		if elapsed < int64(cooldownSecs) {
-			fmt.Printf("%s ⏳ in cooldown (%ds remaining)\n", prefix, int64(cooldownSecs)-elapsed)
-			return
-		}
+	prefix := fmt.Sprintf("  [%d] %s:", index, label)
+	if lastLimitedAt > 0 && now-lastLimitedAt < int64(cooldownSeconds) {
+		fmt.Printf("%s in cooldown (%ds remaining)\n", prefix, int64(cooldownSeconds)-(now-lastLimitedAt))
+		return
 	}
 	if isAPIKeyMode(auth.Mode) {
-		if auth.APIKey != "" {
-			fmt.Printf("%s ✓ API key configured (mode: api_key)\n", prefix)
-		} else {
-			fmt.Printf("%s ✗ not authenticated (mode: api_key)\n", prefix)
-		}
+		key, source, _ := resolveCodexAPIKey(auth)
+		fmt.Printf("%s api_key configured=%t source=%s\n", prefix, key != "", source)
 		return
 	}
 	if auth.AccessToken == "" {
-		fmt.Printf("%s ✗ not authenticated\n", prefix)
+		fmt.Printf("%s not authenticated\n", prefix)
 		return
 	}
-	if auth.ExpiresAt > 0 {
-		remaining := auth.ExpiresAt - now
-		if remaining > 0 {
-			fmt.Printf("%s ✓ authenticated (expires in %dm %ds)\n", prefix, remaining/60, remaining%60)
-		} else {
-			fmt.Printf("%s ⚠ token expired\n", prefix)
-		}
+	remaining := auth.ExpiresAt - now
+	if auth.ExpiresAt == 0 {
+		fmt.Printf("%s authenticated (expiry unavailable)\n", prefix)
+	} else if remaining > 0 {
+		fmt.Printf("%s authenticated (expires in %dm %ds)\n", prefix, remaining/60, remaining%60)
 	} else {
-		fmt.Printf("%s ✓ authenticated (no expiry info)\n", prefix)
+		fmt.Printf("%s token expired\n", prefix)
 	}
 }
 
 func printCodexAuthLines(auth *CodexAuthState) {
-	now := time.Now().Unix()
 	if isAPIKeyMode(auth.Mode) {
 		key, source, err := resolveCodexAPIKey(auth)
 		if err != nil {
-			fmt.Printf("  Auth: ⚠  Credential lookup failed: %v\n", err)
-		} else if key != "" {
-			fmt.Printf("  Auth: ✓ API key configured\n")
+			fmt.Printf("  Auth: credential lookup failed: %v\n", err)
+		} else {
+			fmt.Printf("  Auth: API key configured=%t\n", key != "")
 			fmt.Printf("  Credential source: %s\n", source)
-			fmt.Printf("  Backend: api.openai.com/v1\n")
-		} else {
-			fmt.Printf("  Auth: ✗ No API key — run '%s auth codex --api-key <key>'\n", os.Args[0])
 		}
+		fmt.Println("  Backend: api.openai.com/v1")
 		fmt.Printf("  Mode: %s\n", auth.Mode)
 		return
 	}
-
-	resolved, err := resolveCodexChatGPTAuth(auth)
-	if err != nil {
-		fmt.Printf("  Auth: ⚠  Credential lookup failed: %v\n", err)
-		fmt.Printf("  Mode: %s\n", auth.Mode)
-		fmt.Printf("  Backend: %s\n", defaultChatGPTBaseURL)
-		return
+	resolved := &resolvedCodexChatGPTAuth{
+		AccessToken: auth.AccessToken, RefreshToken: auth.RefreshToken,
+		ExpiresAt: auth.ExpiresAt, AccountID: auth.AccountID,
+		Source: codexCredentialSourceProxyConfig,
 	}
-
-	if resolved != nil {
-		if resolved.ExpiresAt > 0 {
-			remaining := resolved.ExpiresAt - now
-			if remaining > 0 {
-				fmt.Printf("  Auth: ✓ Authenticated (expires in %dm %ds)\n",
-					remaining/60, remaining%60)
-				if remaining <= 300 {
-					fmt.Printf("  Status: ⚠  Refresh imminent\n")
-				} else {
-					fmt.Printf("  Status: ✅ Token healthy\n")
-				}
-			} else {
-				fmt.Printf("  Auth: ⚠  Token EXPIRED (%d s ago)\n", -remaining)
-			}
+	if resolved.AccessToken == "" {
+		imported, err := resolveCodexChatGPTAuth(auth)
+		if err != nil {
+			fmt.Printf("  Auth: credential lookup failed: %v\n", err)
+		} else if imported != nil {
+			resolved = imported
+		}
+	}
+	if resolved.AccessToken == "" {
+		fmt.Printf("  Auth: not authenticated — run '%s auth codex'\n", os.Args[0])
+	} else {
+		remaining := resolved.ExpiresAt - time.Now().Unix()
+		if resolved.ExpiresAt == 0 {
+			fmt.Println("  Auth: token available (expiry unavailable)")
+		} else if remaining > 0 {
+			fmt.Printf("  Auth: authenticated (expires in %dm %ds)\n", remaining/60, remaining%60)
 		} else {
-			fmt.Printf("  Auth: ✓ Token available (no expiry info)\n")
+			fmt.Printf("  Auth: token expired (%ds ago)\n", -remaining)
 		}
 		fmt.Printf("  Refreshable: %t\n", resolved.RefreshToken != "")
 		fmt.Printf("  Has account metadata: %t\n", resolved.AccountID != "")
 		fmt.Printf("  Credential source: %s\n", resolved.Source)
-	} else {
-		fmt.Printf("  Auth: ✗ Not authenticated — run '%s auth codex'\n", os.Args[0])
 	}
 	fmt.Printf("  Mode: %s\n", auth.Mode)
 	fmt.Printf("  Backend: %s\n", defaultChatGPTBaseURL)
 }
 
-// handleConfig prints the current configuration.
+func printKiloStatus(cfg *Config) {
+	provider := NewKiloProvider(cfg)
+	health := provider.Health(context.Background())
+	_, source := provider.apiKey()
+	backend, backendErr := provider.baseURL()
+	if backendErr != nil {
+		backend = "invalid configuration"
+	}
+	fmt.Println("Provider: Kilo Gateway")
+	fmt.Printf("  Ready: %t\n", health.Authenticated)
+	fmt.Printf("  Credential source: %s\n", source)
+	fmt.Printf("  Anonymous free models: %t\n", cfg.Providers.Kilo.AllowAnonymous)
+	fmt.Printf("  Backend: %s\n\n", backend)
+}
+
 func handleConfig() error {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -428,19 +408,17 @@ func handleConfig() error {
 	fmt.Printf("Configuration file: %s\n", path)
 	fmt.Printf("Config version: %d\n", cfg.ConfigVersion)
 	fmt.Printf("Port: %d\n", cfg.Port)
+	fmt.Printf("Listen address: %s\n", os.Getenv(listenAddressEnv))
 	fmt.Printf("Default model: %s\n", cfg.Routing.DefaultModel)
 	fmt.Printf("Default provider: %s\n", cfg.Routing.DefaultProvider)
 	fmt.Printf("Copilot enabled: %t\n", cfg.Providers.Copilot.Enabled)
 	fmt.Printf("Codex enabled: %t\n", cfg.Providers.Codex.Enabled)
-	fmt.Printf("Copilot allowed models: %v\n", cfg.Providers.Copilot.AllowedModels)
+	fmt.Printf("Kilo enabled: %t\n", cfg.Providers.Kilo.Enabled)
 	return nil
 }
 
-func getCurrentTime() int64 {
-	return time.Now().Unix()
-}
+func getCurrentTime() int64 { return time.Now().Unix() }
 
-// handleRunWithMigration migrates config then starts the proxy server.
 func handleRunWithMigration(migrationMode ConfigMigrationMode) error {
 	if migrationMode != ConfigMigrationNone {
 		fmt.Printf("Running config migration (mode: %s)...\n", migrationMode)
@@ -448,52 +426,54 @@ func handleRunWithMigration(migrationMode ConfigMigrationMode) error {
 			return fmt.Errorf("config migration failed: %w", err)
 		}
 	}
-
 	cfg, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 	initializeTimeouts(cfg)
-
-	// Ensure codex known models are in model_map (persisted to config).
-	if cfg.Providers.Codex.Enabled {
-		if ensureCodexModelMap(cfg) {
-			if err := saveConfig(cfg); err != nil {
-				fmt.Printf("Warning: failed to persist codex model_map: %v\n", err)
-			}
+	if cfg.Providers.Codex.Enabled && ensureCodexModelMap(cfg) {
+		if err := saveConfig(cfg); err != nil {
+			fmt.Printf("Warning: failed to persist Codex model map: %v\n", err)
 		}
 	}
 
-	// Build provider registry.
-	registry := NewProviderRegistry()
-	if cfg.Providers.Copilot.Enabled {
-		registry.Register(NewCopilotProvider(cfg))
+	runtimeManager, err := runtimepkg.NewManager(cfg)
+	if err != nil {
+		return fmt.Errorf("create runtime manager: %w", err)
 	}
-	if cfg.Providers.Codex.Enabled {
-		registry.Register(NewCodexProvider(cfg))
+	providerManager, err := newProviderManager(cfg, runtimeManager)
+	if err != nil {
+		shutdownContext, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = runtimeManager.Close(shutdownContext)
+		return fmt.Errorf("create provider manager: %w", err)
 	}
-
-	// Eagerly authenticate; non-fatal per provider.
 	ctx := context.Background()
-	for _, p := range registry.All() {
-		if err := p.EnsureAuthenticated(ctx); err != nil {
-			fmt.Printf("Warning: provider %s auth failed: %v\n", p.ID(), err)
+	for _, provider := range providerManager.ActiveProviders() {
+		if err := provider.EnsureAuthenticated(ctx); err != nil {
+			fmt.Printf("Warning: provider %s auth failed: %v\n", provider.ID(), err)
 		}
 	}
-
-	router := NewModelRouter(registry, cfg.Routing)
-
+	providerManager.RefreshHealth(ctx)
+	defer func() {
+		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = providerManager.Reconcile(shutdownContext, nil)
+		_ = runtimeManager.Close(shutdownContext)
+	}()
 	setupLogging()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/models", modelsHandler(registry, cfg))
-	mux.HandleFunc("/v1/models/", modelsHandler(registry, cfg))
-	mux.HandleFunc("/v1/embeddings", proxyHandler(registry, router, cfg))
-	mux.HandleFunc("/v1/embeddings/", proxyHandler(registry, router, cfg))
-	mux.HandleFunc("/v1/chat/completions", proxyHandler(registry, router, cfg))
-	mux.HandleFunc("/v1/chat/completions/", proxyHandler(registry, router, cfg))
-	mux.HandleFunc("/health", healthHandler)
-	mux.HandleFunc("/health/", healthHandler)
+	mux.HandleFunc("/v1/models", managedModelsHandler(runtimeManager))
+	mux.HandleFunc("/v1/models/", managedModelsHandler(runtimeManager))
+	mux.HandleFunc("/v1/embeddings", managedProxyHandler(runtimeManager))
+	mux.HandleFunc("/v1/embeddings/", managedProxyHandler(runtimeManager))
+	mux.HandleFunc("/v1/chat/completions", managedProxyHandler(runtimeManager))
+	mux.HandleFunc("/v1/chat/completions/", managedProxyHandler(runtimeManager))
+	mux.HandleFunc("/v1/responses", managedProxyHandler(runtimeManager))
+	mux.HandleFunc("/v1/responses/", managedProxyHandler(runtimeManager))
+	mux.HandleFunc("/health", managedHealthHandler(providerManager))
+	mux.HandleFunc("/health/", managedHealthHandler(providerManager))
 	if cfg.EnablePprof {
 		mux.HandleFunc("/debug/pprof/", http.DefaultServeMux.ServeHTTP)
 		mux.HandleFunc("/debug/pprof/cmdline", http.DefaultServeMux.ServeHTTP)
@@ -504,40 +484,40 @@ func handleRunWithMigration(migrationMode ConfigMigrationMode) error {
 
 	port := cfg.Port
 	if port == 0 {
-		port = 8081
+		port = 7071
 	}
-
+	address, err := configuredListenAddress(port)
+	if err != nil {
+		return err
+	}
 	server := &http.Server{
-		Addr:         fmt.Sprintf(":%d", port),
-		Handler:      mux,
+		Addr:         address,
+		Handler:      secureHandler(mux),
 		ReadTimeout:  time.Duration(cfg.Timeouts.ServerRead) * time.Second,
 		WriteTimeout: time.Duration(cfg.Timeouts.ServerWrite) * time.Second,
 		IdleTimeout:  time.Duration(cfg.Timeouts.ServerIdle) * time.Second,
 	}
 	setupGracefulShutdown(server)
-
-	fmt.Printf("Starting proxy on :%d\n", port)
-	fmt.Printf("  /v1/models              → aggregated from all providers\n")
-	fmt.Printf("  /v1/chat/completions    → routed per model\n")
-	fmt.Printf("  /v1/embeddings          → routed per model\n")
+	fmt.Printf("Starting proxy on %s\n", address)
+	fmt.Println("  /v1/models              → aggregated from all providers")
+	fmt.Println("  /v1/chat/completions    → Chat Completions compatibility")
+	fmt.Println("  /v1/responses           → native Responses API")
+	fmt.Println("  /v1/embeddings          → API-key-capable providers only")
 	if cfg.EnablePprof {
-		fmt.Printf("  /debug/pprof/           → enabled\n")
+		fmt.Println("  /debug/pprof/           → enabled and access-controlled")
 	}
-
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("server: %w", err)
 	}
 	return nil
 }
 
-// handleModels lists models from the given provider (or all providers).
-func handleModels(providerFilter string) error {
+func handleModels(providerFilter string, forceRefresh bool) error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 	initializeTimeouts(cfg)
-
 	registry := NewProviderRegistry()
 	if cfg.Providers.Copilot.Enabled {
 		registry.Register(NewCopilotProvider(cfg))
@@ -545,33 +525,45 @@ func handleModels(providerFilter string) error {
 	if cfg.Providers.Codex.Enabled {
 		registry.Register(NewCodexProvider(cfg))
 	}
-
+	if cfg.Providers.Kilo.Enabled {
+		registry.Register(NewKiloProvider(cfg))
+	}
 	ctx := context.Background()
-	for _, p := range registry.All() {
-		if providerFilter != "" && string(p.ID()) != providerFilter {
+	for _, provider := range registry.All() {
+		if providerFilter != "" && string(provider.ID()) != providerFilter {
 			continue
 		}
-		ml, err := p.ListModels(ctx)
+		if forceRefresh {
+			invalidateProviderModelCache(provider)
+		}
+		models, err := provider.ListModels(ctx)
 		if err != nil {
-			fmt.Printf("[%s] error: %v\n", p.Name(), err)
+			fmt.Printf("[%s] error: %v\n", provider.Name(), err)
 			continue
 		}
-		fmt.Printf("[%s] %d model(s):\n", p.Name(), len(ml.Data))
-		for _, m := range ml.Data {
-			fmt.Printf("  - %s (%s)\n", m.ID, m.OwnedBy)
+		fmt.Printf("[%s] %d model(s):\n", provider.Name(), len(models.Data))
+		for _, model := range models.Data {
+			fmt.Printf("  - %s (%s)\n", model.ID, model.OwnedBy)
 		}
 	}
 	return nil
 }
 
-// handleRefresh forces a token refresh for Copilot (and/or Codex when applicable).
+func invalidateProviderModelCache(p Provider) {
+	type cacheAware interface {
+		InvalidateModelCache()
+	}
+	if cache, ok := p.(cacheAware); ok {
+		cache.InvalidateModelCache()
+	}
+}
+
 func handleRefresh(providerFilter string) error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 	initializeTimeouts(cfg)
-
 	if providerFilter == "" || providerFilter == string(ProviderCopilot) {
 		if err := refreshCopilot(cfg); err != nil {
 			return err
@@ -581,6 +573,15 @@ func handleRefresh(providerFilter string) error {
 		if err := refreshCodex(cfg); err != nil {
 			return err
 		}
+	}
+	if providerFilter == string(ProviderKilo) && cfg.Providers.Kilo.Enabled {
+		provider := NewKiloProvider(cfg)
+		provider.InvalidateModelCache()
+		models, err := provider.ListModels(context.Background())
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Kilo model catalog refreshed (%d models).\n", len(models.Data))
 	}
 	return nil
 }
@@ -600,127 +601,87 @@ func refreshCopilot(cfg *Config) error {
 				continue
 			}
 			remaining := auth.ExpiresAt - time.Now().Unix()
-			fmt.Printf("  [%s] ✅ refreshed (expires in %dm %ds)\n", accounts[i].Label, remaining/60, remaining%60)
+			fmt.Printf("  [%s] refreshed (expires in %dm %ds)\n", accounts[i].Label, remaining/60, remaining%60)
 			refreshed++
 		}
 		if refreshed == 0 {
-			return fmt.Errorf("no Copilot accounts refreshed — run 'auth copilot' to authenticate")
+			return fmt.Errorf("no Copilot accounts refreshed — run 'auth copilot'")
 		}
 		return nil
 	}
 	auth := &cfg.Providers.Copilot.Auth
 	if auth.CopilotToken == "" {
-		return fmt.Errorf("no Copilot token - run 'auth copilot' first")
+		return fmt.Errorf("no Copilot token — run 'auth copilot'")
 	}
-	fmt.Println("Refreshing Copilot token...")
 	if err := copilotRefreshToken(auth, func() error { return saveConfig(cfg) }); err != nil {
 		return fmt.Errorf("Copilot refresh failed: %w", err)
 	}
-	remaining := auth.ExpiresAt - time.Now().Unix()
-	fmt.Printf("✅ Copilot token refreshed (expires in %dm %ds)\n", remaining/60, remaining%60)
 	return nil
 }
 
 func refreshCodex(cfg *Config) error {
-	pCfg := &cfg.Providers.Codex
-	accounts := pCfg.Accounts
-
-	if len(accounts) > 0 {
+	provider := &cfg.Providers.Codex
+	if len(provider.Accounts) > 0 {
 		refreshed := 0
-		for i := range accounts {
-			auth := &accounts[i].Auth
+		for i := range provider.Accounts {
+			account := &provider.Accounts[i]
+			auth := &account.Auth
 			if isAPIKeyMode(auth.Mode) {
-				fmt.Printf("  [%s] API key mode — no token refresh needed\n", accounts[i].Label)
+				fmt.Printf("  [%s] API-key mode — no refresh needed\n", account.Label)
 				refreshed++
 				continue
 			}
-			working := *auth
-			resolved, err := resolveCodexChatGPTAuth(auth)
-			if err != nil {
-				fmt.Printf("  [%s] credential lookup failed: %v\n", accounts[i].Label, err)
+			if auth.AccessToken == "" {
+				fmt.Printf("  [%s] not authenticated — run 'auth codex --account %s'\n", account.Label, account.Label)
 				continue
 			}
-			if resolved != nil {
-				applyResolvedCodexChatGPTAuth(&working, resolved)
-			}
-			if working.AccessToken == "" {
-				fmt.Printf("  [%s] not authenticated — run 'auth codex --account %s' first\n",
-					accounts[i].Label, accounts[i].Label)
+			if auth.RefreshToken == "" {
+				fmt.Printf("  [%s] no refresh token — re-authentication required\n", account.Label)
 				continue
 			}
-			if working.RefreshToken == "" {
-				fmt.Printf("  [%s] no refresh token — re-authenticating...\n", accounts[i].Label)
-				if err := handleAuthCodex(accounts[i].Label); err != nil {
-					fmt.Printf("  [%s] re-auth failed: %v\n", accounts[i].Label, err)
-				}
+			if err := codexRefreshToken(auth, func() error { return nil }); err != nil {
+				fmt.Printf("  [%s] refresh failed: %v\n", account.Label, err)
 				continue
 			}
-			if err := codexRefreshToken(&working, func() error { return nil }); err != nil {
-				fmt.Printf("  [%s] refresh failed: %v\n", accounts[i].Label, err)
-				continue
-			}
-			if err := persistToOfficialStore(&working); err != nil {
-				fmt.Printf("  [%s] persist failed: %v\n", accounts[i].Label, err)
-				continue
-			}
-			auth.AccessToken = working.AccessToken
-			auth.RefreshToken = working.RefreshToken
-			auth.ExpiresAt = working.ExpiresAt
-			auth.AccountID = working.AccountID
 			remaining := auth.ExpiresAt - time.Now().Unix()
-			fmt.Printf("  [%s] ✅ refreshed (expires in %dm %ds)\n", accounts[i].Label, remaining/60, remaining%60)
+			fmt.Printf("  [%s] refreshed (expires in %dm %ds)\n", account.Label, remaining/60, remaining%60)
 			refreshed++
 		}
 		if err := saveConfig(cfg); err != nil {
 			return fmt.Errorf("persist Codex config: %w", err)
 		}
 		if refreshed == 0 {
-			return fmt.Errorf("no Codex accounts refreshed — run 'auth codex' to authenticate")
+			return fmt.Errorf("no Codex accounts refreshed — run 'auth codex'")
 		}
 		return nil
 	}
 
-	auth := &pCfg.Auth
+	auth := &provider.Auth
 	if isAPIKeyMode(auth.Mode) {
 		key, _, err := resolveCodexAPIKey(auth)
 		if err != nil {
 			return err
 		}
 		if key == "" {
-			return fmt.Errorf("no Codex API key - run 'auth codex --api-key' first")
+			return fmt.Errorf("no Codex API key configured")
 		}
-		fmt.Println("Codex API key mode does not use token refresh.")
+		fmt.Println("Codex API-key mode does not use token refresh.")
 		return nil
 	}
-
-	working := *auth
-	resolved, err := resolveCodexChatGPTAuth(auth)
-	if err != nil {
+	if auth.AccessToken == "" {
+		resolved, err := resolveCodexChatGPTAuth(auth)
+		if err != nil {
+			return err
+		}
+		if resolved != nil {
+			applyResolvedCodexChatGPTAuth(auth, resolved)
+		}
+	}
+	if auth.AccessToken == "" || auth.RefreshToken == "" {
+		return fmt.Errorf("Codex credentials are not refreshable — run 'auth codex'")
+	}
+	if err := codexRefreshToken(auth, func() error { return nil }); err != nil {
 		return err
 	}
-	if resolved != nil {
-		applyResolvedCodexChatGPTAuth(&working, resolved)
-	}
-	if working.AccessToken == "" {
-		return fmt.Errorf("no Codex token — run 'auth codex' first")
-	}
-	if working.RefreshToken == "" {
-		fmt.Println("Codex: no refresh token available, re-authenticating...")
-		return handleAuthCodex("")
-	}
-	fmt.Println("Refreshing Codex token...")
-	if err := codexRefreshToken(&working, func() error { return nil }); err != nil {
-		fmt.Printf("Refresh failed: %v — re-authenticating...\n", err)
-		return handleAuthCodex("")
-	}
-	if err := persistToOfficialStore(&working); err != nil {
-		return fmt.Errorf("persist refreshed Codex credentials: %w", err)
-	}
-	clearPersistedChatGPTSecrets(auth)
-	if err := saveConfig(cfg); err != nil {
-		return fmt.Errorf("persist Codex config: %w", err)
-	}
-	remaining := working.ExpiresAt - time.Now().Unix()
-	fmt.Printf("✅ Codex token refreshed (expires in %dm %ds)\n", remaining/60, remaining%60)
-	return nil
+	return saveConfig(cfg)
 }

@@ -1,4 +1,4 @@
-package main
+package yarouter
 
 import "testing"
 
@@ -7,8 +7,9 @@ func TestProviderPrefix(t *testing.T) {
 		providerID ProviderID
 		want       string
 	}{
-		{ProviderCopilot, "gc-"},
-		{ProviderCodex, "oc-"},
+		{ProviderCopilot, "github/"},
+		{ProviderCodex, "codex/"},
+		{ProviderKilo, "kilo/"},
 		{"unknown", ""},
 		{"", ""},
 	}
@@ -27,6 +28,7 @@ func TestProviderOwnedBy(t *testing.T) {
 	}{
 		{ProviderCopilot, "github-copilot"},
 		{ProviderCodex, "openai"},
+		{ProviderKilo, "kilo"},
 		{"unknown", "openai"},
 	}
 	for _, tt := range tests {
@@ -43,12 +45,13 @@ func TestAddModelPrefix(t *testing.T) {
 		modelID    string
 		want       string
 	}{
-		{ProviderCopilot, "gpt-4o", "gc-gpt-4o"},
-		{ProviderCodex, "gpt-5.3-codex", "oc-gpt-5.3-codex"},
-		{ProviderCopilot, "gc-gpt-4o", "gc-gpt-4o"}, // already prefixed
-		{ProviderCodex, "oc-gpt-5", "oc-gpt-5"},     // already prefixed
-		{"unknown", "gpt-4o", "gpt-4o"},             // unknown provider: no prefix
-		{"", "gpt-4o", "gpt-4o"},                    // empty provider: no prefix
+		{ProviderCopilot, "gpt-4o", "github/gpt-4o"},
+		{ProviderCodex, "gpt-5.3-codex", "codex/gpt-5.3-codex"},
+		{ProviderKilo, "kilo-auto/free", "kilo/kilo-auto/free"},
+		{ProviderCopilot, "github/gpt-4o", "github/gpt-4o"}, // already prefixed
+		{ProviderCodex, "codex/gpt-5", "codex/gpt-5"},       // already prefixed
+		{"unknown", "gpt-4o", "gpt-4o"},                     // unknown provider: no prefix
+		{"", "gpt-4o", "gpt-4o"},                            // empty provider: no prefix
 	}
 	for _, tt := range tests {
 		got := AddModelPrefix(tt.providerID, tt.modelID)
@@ -65,10 +68,12 @@ func TestStripModelPrefix(t *testing.T) {
 		wantProvider ProviderID
 		wantOK       bool
 	}{
-		{"gc-gpt-4o", "gpt-4o", ProviderCopilot, true},
-		{"oc-gpt-5.3-codex", "gpt-5.3-codex", ProviderCodex, true},
-		{"gc-", "", ProviderCopilot, true}, // bare prefix only
-		{"oc-", "", ProviderCodex, true},
+		{"github/gpt-4o", "gpt-4o", ProviderCopilot, true},
+		{"codex/gpt-5.3-codex", "gpt-5.3-codex", ProviderCodex, true},
+		{"codex/gpt-5.4-mini", "gpt-5.4-mini", ProviderCodex, true},
+		{"kilo/kilo-auto/free", "kilo-auto/free", ProviderKilo, true},
+		{"github/", "", ProviderCopilot, true}, // bare prefix only
+		{"codex/", "", ProviderCodex, true},
 		{"gpt-4o", "gpt-4o", "", false}, // no prefix
 		{"claude-3.5-sonnet", "claude-3.5-sonnet", "", false},
 		{"", "", "", false},

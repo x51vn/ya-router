@@ -1,5 +1,5 @@
 // models.go — unified /v1/models handler and shared model utilities.
-package main
+package yarouter
 
 import (
 	"context"
@@ -16,8 +16,8 @@ import (
 //
 // The filter is prefix-tolerant: a model ID with a provider prefix matches an
 // allowed entry that specifies only the bare ID, and vice versa.  For example,
-// an allowed list entry "gpt-4o" will match the model "gc-gpt-4o", and an entry
-// "gc-gpt-4o" will match the model "gc-gpt-4o" exactly.
+// an allowed list entry "gpt-4o" will match the model "github/gpt-4o", and an
+// entry "github/gpt-4o" will match that prefixed model exactly.
 //
 // If the allowedModels list is set but no models match, a synthetic entry for
 // each allowed ID is returned so clients can still see the allowed model names.
@@ -47,6 +47,22 @@ func filterAllowedModels(modelList *ModelList, allowedModels []string) *ModelLis
 	return &ModelList{Object: "list", Data: filtered}
 }
 
+func shouldRefreshModels(r *http.Request) bool {
+	val := strings.TrimSpace(r.URL.Query().Get("refresh"))
+	return val == "1" || strings.EqualFold(val, "true") || strings.EqualFold(val, "yes") || strings.EqualFold(val, "on")
+}
+
+func invalidateProvidersModelCache(registry *ProviderRegistry) {
+	type cacheAware interface {
+		InvalidateModelCache()
+	}
+	for _, p := range registry.All() {
+		if cache, ok := p.(cacheAware); ok {
+			cache.InvalidateModelCache()
+		}
+	}
+}
+
 // isModelAllowedWithPrefix reports whether modelID is permitted by the
 // allowedModels list, comparing both the full ID and the bare (prefix-stripped)
 // ID against each allowed entry (also checked bare and prefixed).
@@ -70,14 +86,18 @@ func isModelAllowedWithPrefix(modelID string, allowedModels []string) bool {
 // modelsHandler returns an HTTP handler that merges model lists from all
 // enabled providers and writes the combined list as JSON.
 //
-// Each model ID is prefixed with the provider's namespace prefix (e.g. "gc-"
-// for Copilot, "oc-" for Codex) so clients can target a provider
+// Each model ID is prefixed with the provider's namespace prefix (for example,
+// "github/", "codex/", or "kilo/") so clients can target a provider
 // deterministically.  The prefix is stripped by the router before any request
 // is forwarded to the upstream.
 func modelsHandler(registry *ProviderRegistry, cfg *Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
+
+		if shouldRefreshModels(r) {
+			invalidateProvidersModelCache(registry)
+		}
 
 		seen := make(map[string]bool)
 		var allModels []Model

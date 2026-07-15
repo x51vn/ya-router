@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - 'agent/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+          cache: false
+
+      - name: Verify formatting
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l ./cmd ./internal ./src)"
+          if [ -n "$unformatted" ]; then
+            printf 'Files require gofmt:\n%s\n' "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test with race detector
+        id: race_tests
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -race -count=1 ./... 2>&1 | tee race-test.log
+
+      - name: Upload failing race-test diagnostics
+        if: steps.race_tests.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: race-test-log
+          path: race-test.log
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Fail on race-test regression
+        if: steps.race_tests.outcome == 'failure'
+        run: exit 1
+
+      - name: Build compatibility, daemon, and client binaries
+        if: steps.race_tests.outcome == 'success'
+        run: |
+          go build -trimpath -o /tmp/ya-router ./cmd/ya-router
+          go build -trimpath -o /tmp/ya-routerd ./cmd/ya-routerd
+          go build -trimpath -o /tmp/ya ./cmd/ya
+
+      - name: Build compatibility container
+        if: steps.race_tests.outcome == 'success'
+        run: docker build --build-arg IMAGE_VERSION="${GITHUB_SHA}" -t ya-router:ci .

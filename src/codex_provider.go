@@ -1,19 +1,16 @@
 // codex_provider.go — OpenAI Codex backend provider implementation.
 //
-// Two credential modes are supported:
-//   - "chatgpt" / "device_code": uses ChatGPT-backed Codex credentials from
-//     the official Codex auth store (with legacy config fallback). Requests go
-//     to chatgpt.com/backend-api/responses and require chatgpt-account-id.
-//   - "api_key": uses a user-supplied sk-... API key sent to api.openai.com/v1.
-package main
+// ChatGPT auth uses the ChatGPT/Codex backend only. API-key auth uses OpenAI
+// Platform endpoints only. Credentials never cross those transport domains.
+package yarouter
 
 import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -23,40 +20,34 @@ const (
 	defaultPlatformBaseURL = "https://api.openai.com/v1"
 )
 
-// CodexProvider implements Provider for the OpenAI Codex / API backend.
+// CodexProvider implements Provider for ChatGPT-backed Codex and Platform API mode.
 type CodexProvider struct {
 	cfg           *Config
 	mu            sync.Mutex
 	cb            *CircuitBreaker
 	cache         *ModelCache
 	accountCursor int
-	// proxyExecutor is nil in production. Tests may set it to intercept outbound
-	// requests and return a synthetic response, bypassing real HTTP calls.
+	// proxyExecutor is nil in production. Tests may intercept outbound requests.
 	proxyExecutor func(ctx context.Context, r *http.Request, body []byte, cap Capability) (*http.Response, string, error)
 }
 
-// setChatGPTHeaders sets authentication headers for chatgpt.com/backend-api/.
 func setChatGPTHeaders(req *http.Request, token, accountID string) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("User-Agent", codexUserAgent)
 	if accountID != "" {
 		req.Header.Set("chatgpt-account-id", accountID)
-	} else {
-		log.Printf("[codex] warning: no account_id — chatgpt.com requests may fail; re-run 'auth codex'")
 	}
 }
 
-// setPlatformHeaders sets standard Platform API headers (api.openai.com).
 func setPlatformHeaders(req *http.Request, token string) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("User-Agent", codexUserAgent)
 }
 
-// NewCodexProvider constructs a CodexProvider from cfg.
 func NewCodexProvider(cfg *Config) *CodexProvider {
 	p := &CodexProvider{
 		cfg: cfg,
@@ -72,8 +63,27 @@ func NewCodexProvider(cfg *Config) *CodexProvider {
 
 func (p *CodexProvider) ID() ProviderID { return ProviderCodex }
 func (p *CodexProvider) Name() string   { return "OpenAI Codex" }
+
+// Capabilities depend on the selected auth transport. ChatGPT credentials do
+// not have Platform embedding scope.
 func (p *CodexProvider) Capabilities() []Capability {
-	return []Capability{CapabilityChat, CapabilityEmbeddings}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if isAPIKeyMode(p.authState().Mode) {
+		return []Capability{CapabilityChat, CapabilityResponses, CapabilityEmbeddings}
+	}
+	return []Capability{CapabilityChat, CapabilityResponses}
+}
+
+func (p *CodexProvider) chatGPTBaseURL() string {
+	base := strings.TrimSpace(p.cfg.Providers.Codex.ChatGPTBaseURL)
+	if base == "" {
+		base = defaultChatGPTBaseURL
+	}
+	if !strings.HasSuffix(base, "/") {
+		base += "/"
+	}
+	return base
 }
 
 func (p *CodexProvider) activeAccount() *CodexAccount {
@@ -81,31 +91,31 @@ func (p *CodexProvider) activeAccount() *CodexAccount {
 	if len(accounts) == 0 {
 		return nil
 	}
-	if p.accountCursor >= len(accounts) {
+	if p.accountCursor < 0 || p.accountCursor >= len(accounts) {
 		p.accountCursor = 0
 	}
 	return &p.cfg.Providers.Codex.Accounts[p.accountCursor]
 }
 
 func (p *CodexProvider) authState() *CodexAuthState {
-	if acc := p.activeAccount(); acc != nil {
-		return &acc.Auth
+	if account := p.activeAccount(); account != nil {
+		return &account.Auth
 	}
 	return &p.cfg.Providers.Codex.Auth
 }
 
 func (p *CodexProvider) codexCooldownSeconds() int64 {
-	if s := p.cfg.Providers.Codex.AccountCooldownSeconds; s > 0 {
-		return int64(s)
+	if seconds := p.cfg.Providers.Codex.AccountCooldownSeconds; seconds > 0 {
+		return int64(seconds)
 	}
 	return 300
 }
 
-func (p *CodexProvider) isCodexAccountInCooldown(acc *CodexAccount) bool {
-	if acc.LastLimitedAt == 0 {
+func (p *CodexProvider) isCodexAccountInCooldown(account *CodexAccount) bool {
+	if account == nil || account.LastLimitedAt == 0 {
 		return false
 	}
-	return time.Now().Unix()-acc.LastLimitedAt < p.codexCooldownSeconds()
+	return time.Now().Unix()-account.LastLimitedAt < p.codexCooldownSeconds()
 }
 
 func (p *CodexProvider) firstHealthyCodexAccount() int {
@@ -119,177 +129,192 @@ func (p *CodexProvider) firstHealthyCodexAccount() int {
 }
 
 func (p *CodexProvider) advanceCodexAccount() bool {
+	return p.advanceCodexAccountFrom(p.accountCursor)
+}
+
+// advanceCodexAccountFrom marks the account that served the failed request,
+// even if another concurrent response already changed the shared cursor.
+// Caller must hold p.mu.
+func (p *CodexProvider) advanceCodexAccountFrom(failedIndex int) bool {
 	accounts := p.cfg.Providers.Codex.Accounts
+	if failedIndex < 0 || failedIndex >= len(accounts) {
+		return false
+	}
+	accounts[failedIndex].LastLimitedAt = time.Now().Unix()
 	if len(accounts) <= 1 {
 		return false
 	}
-	accounts[p.accountCursor].LastLimitedAt = time.Now().Unix()
-	next := (p.accountCursor + 1) % len(accounts)
+	next := p.accountCursor
+	if next == failedIndex {
+		next = (failedIndex + 1) % len(accounts)
+	}
 	for i := 0; i < len(accounts); i++ {
-		idx := (next + i) % len(accounts)
-		if !p.isCodexAccountInCooldown(&accounts[idx]) {
-			p.accountCursor = idx
+		index := (next + i) % len(accounts)
+		if index == failedIndex {
+			continue
+		}
+		if !p.isCodexAccountInCooldown(&accounts[index]) {
+			p.accountCursor = index
 			return true
 		}
 	}
 	return false
 }
 
-func (p *CodexProvider) save() error {
-	return saveConfig(p.cfg)
-}
+func (p *CodexProvider) save() error { return persistCodexRuntimeAccount(p.cfg, p.accountCursor) }
 
-// authCredentials returns the current bearer token, account_id, and mode under lock.
 func (p *CodexProvider) authCredentials() (token, accountID string, chatgpt bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	auth := p.authState()
+	credential := p.credentialAtLocked(p.accountCursor)
+	return credential.token, credential.accountID, credential.chatgpt
+}
+
+type codexCredential struct {
+	index     int
+	token     string
+	accountID string
+	chatgpt   bool
+}
+
+func (p *CodexProvider) selectedCredential() codexCredential {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.credentialAtLocked(p.accountCursor)
+}
+
+func (p *CodexProvider) credentialAtLocked(index int) codexCredential {
+	auth := &p.cfg.Providers.Codex.Auth
+	if len(p.cfg.Providers.Codex.Accounts) > 0 && index >= 0 && index < len(p.cfg.Providers.Codex.Accounts) {
+		auth = &p.cfg.Providers.Codex.Accounts[index].Auth
+	}
 	if isAPIKeyMode(auth.Mode) {
 		key, _, err := resolveCodexAPIKey(auth)
 		if err != nil {
-			log.Printf("[codex] API key resolution failed: %v", err)
-			return "", "", false
+			log.Printf("[codex] API-key resolution failed: %v", err)
+			return codexCredential{index: index}
 		}
-		return key, "", false
+		return codexCredential{index: index, token: key}
 	}
-	// chatgpt / device_code mode: bearer token from device auth.
-	return auth.AccessToken, auth.AccountID, true
+	return codexCredential{index: index, token: auth.AccessToken, accountID: auth.AccountID, chatgpt: true}
 }
 
-// currentToken returns the current access token under lock.
 func (p *CodexProvider) currentToken() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.authState().AccessToken
 }
 
-// reloadTokenFromDisk re-reads the config file and updates the in-memory
-// Codex auth state.  This allows the running proxy to pick up tokens
-// written by a separate "auth codex" CLI invocation.
+// reloadTokenFromDisk refreshes the selected account from ya-router's own config.
 func (p *CodexProvider) reloadTokenFromDisk() {
 	fresh, err := loadConfig()
 	if err != nil {
 		log.Printf("[codex] config reload failed: %v", err)
 		return
 	}
-	new := &fresh.Providers.Codex.Auth
-	old := p.authState()
-	if new.AccessToken != "" && new.AccessToken != old.AccessToken {
-		log.Printf("[codex] detected new token on disk — reloading")
-		old.AccessToken = new.AccessToken
-		old.RefreshToken = new.RefreshToken
-		old.ExpiresAt = new.ExpiresAt
-		old.AccountID = new.AccountID
-	} else if old.AccountID == "" && new.AccountID != "" {
-		// Same token but account_id was subsequently added to disk (e.g. by
-		// a separate 'auth codex' invocation running against the same config).
-		log.Printf("[codex] updated account_id metadata from on-disk config")
-		old.AccountID = new.AccountID
+	current := p.activeAccount()
+	if current != nil {
+		for i := range fresh.Providers.Codex.Accounts {
+			candidate := &fresh.Providers.Codex.Accounts[i]
+			if candidate.Label == current.Label && candidate.Auth.AccessToken != "" {
+				current.Auth = candidate.Auth
+				return
+			}
+		}
+		return
+	}
+	if fresh.Providers.Codex.Auth.AccessToken != "" {
+		p.cfg.Providers.Codex.Auth = fresh.Providers.Codex.Auth
 	}
 }
 
-// reloadFromOfficialStore reads the official Codex auth store and
-// merges fresh credentials into the in-memory auth state.
+// reloadFromOfficialStore performs read-only import and never overwrites an
+// account-owned credential.
 func (p *CodexProvider) reloadFromOfficialStore() {
+	auth := p.authState()
+	if auth.AccessToken != "" {
+		return
+	}
 	official, err := loadOfficialCodexAuth()
 	if err != nil {
-		log.Printf("[codex] official store load failed: %v", err)
+		log.Printf("[codex] official credential import failed: %v", err)
 		return
 	}
-	if official == nil {
+	if official == nil || official.AccessToken == "" {
 		return
 	}
-	auth := p.authState()
-	if official.AccessToken != "" && official.AccessToken != auth.AccessToken {
-		log.Printf("[codex] loaded fresh token from official store")
-		auth.AccessToken = official.AccessToken
-		auth.RefreshToken = official.RefreshToken
-		auth.AccountID = official.AccountID
-	} else if auth.AccountID == "" && official.AccountID != "" {
-		auth.AccountID = official.AccountID
-	}
+	auth.Mode = "chatgpt"
+	auth.AccessToken = official.AccessToken
+	auth.RefreshToken = official.RefreshToken
+	auth.ExpiresAt = official.ExpiresAt
+	auth.AccountID = official.AccountID
 }
 
-// EnsureAuthenticated ensures a valid Codex credential is available.
+// EnsureAuthenticated validates the selected account. The provider mutex also
+// provides single-flight refresh behavior for concurrent requests.
 func (p *CodexProvider) EnsureAuthenticated(_ context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
 	auth := p.authState()
 
-	// API key mode — nothing to refresh.
 	if isAPIKeyMode(auth.Mode) {
-		if key, _, err := resolveCodexAPIKey(auth); err == nil && key != "" {
+		key, _, err := resolveCodexAPIKey(auth)
+		if err == nil && key != "" {
 			return nil
 		}
-		return fmt.Errorf("no Codex API key — run 'auth codex --api-key' first")
+		return newProviderError(ProviderCodex, ProviderErrorAuthRequired, http.StatusUnauthorized, false, "no Codex API key configured")
 	}
 
-	resolved, err := resolveCodexChatGPTAuth(auth)
-	if err != nil {
-		return fmt.Errorf("load Codex credentials: %w", err)
-	}
-	if resolved != nil {
-		applyResolvedCodexChatGPTAuth(auth, resolved)
-	}
 	if auth.AccessToken == "" {
 		p.reloadTokenFromDisk()
-		if auth.AccessToken == "" {
-			return fmt.Errorf("no Codex token — run 'auth codex' first")
-		}
+	}
+	// The official Codex store represents one global account. Import it only for
+	// legacy/single-account setups; never use it to override a pool member.
+	if auth.AccessToken == "" && len(p.cfg.Providers.Codex.Accounts) <= 1 {
+		p.reloadFromOfficialStore()
+	}
+	if auth.AccessToken == "" {
+		return newProviderError(ProviderCodex, ProviderErrorAuthRequired, http.StatusUnauthorized, false, "no Codex token; run 'auth codex'")
 	}
 	if auth.AccountID == "" {
-		p.reloadFromOfficialStore()
-		if auth.AccountID == "" {
-			p.reloadTokenFromDisk()
-		}
-		if auth.AccountID != "" {
-			log.Printf("[codex] picked up account_id metadata from on-disk credentials")
-		}
+		auth.AccountID = extractAccountIDFromJWT(auth.AccessToken)
+	}
+	if auth.ExpiresAt == 0 {
+		auth.ExpiresAt = extractJWTExpiry(auth.AccessToken)
 	}
 
-	// Check expiry and refresh if needed.
 	now := time.Now().Unix()
-	if auth.ExpiresAt > 0 {
-		remaining := auth.ExpiresAt - now
-		threshold := int64(300)
-		if remaining <= threshold {
-			log.Printf("[codex] token expiring in %ds, refreshing...", remaining)
-			if err := codexRefreshToken(auth, p.save); err != nil {
-				log.Printf("[codex] refresh failed: %v", err)
-				p.reloadFromOfficialStore()
-				if auth.AccessToken == "" {
-					return fmt.Errorf("codex token expired and refresh failed: %w", err)
-				}
-			} else {
-				log.Printf("[codex] token refreshed, new expiry in %ds",
-					auth.ExpiresAt-time.Now().Unix())
+	if auth.ExpiresAt > 0 && auth.ExpiresAt-now <= 300 {
+		if err := codexRefreshToken(auth, p.save); err != nil {
+			if auth.ExpiresAt <= now {
+				return newProviderError(ProviderCodex, ProviderErrorAuthRequired, http.StatusUnauthorized, false, "Codex token expired and refresh failed: %v", err)
 			}
-		} else {
-			log.Printf("[codex] token valid, expires in %dm%ds",
-				remaining/60, remaining%60)
+			log.Printf("[codex] proactive refresh failed; current token remains valid: %v", err)
 		}
 	}
-
-	// Final fallback: the device-code access_token is itself a JWT that
-	// contains chatgpt_account_id.  Extract it directly so requests work
-	// even when neither config.json nor ~/.codex/auth.json have the field.
-	if auth.AccountID == "" && auth.AccessToken != "" {
-		if aid := extractAccountIDFromJWT(auth.AccessToken); aid != "" {
-			auth.AccountID = aid
-			log.Printf("[codex] extracted account_id metadata from access_token JWT")
-			// Persist so we don't repeat this on every request.
-			_ = p.save()
-		}
-	}
-
 	return nil
 }
 
-// codexKnownModels is the canonical list of models supported by the Codex
-// backend, sourced from the official Codex CLI bundled models.json.
-// All entries have supported_in_api=true in the upstream source.
+func (p *CodexProvider) forceRefreshAccount(index int) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	auth := &p.cfg.Providers.Codex.Auth
+	if len(p.cfg.Providers.Codex.Accounts) > 0 {
+		if index < 0 || index >= len(p.cfg.Providers.Codex.Accounts) {
+			return fmt.Errorf("Codex account index %d is no longer valid", index)
+		}
+		auth = &p.cfg.Providers.Codex.Accounts[index].Auth
+	}
+	if isAPIKeyMode(auth.Mode) {
+		return fmt.Errorf("API-key credentials do not refresh")
+	}
+	return codexRefreshToken(auth, func() error { return persistCodexRuntimeAccount(p.cfg, index) })
+}
+
+// codexKnownModels is a compatibility manifest. Model-map entries are merged
+// so operators can add rollout models without rebuilding the binary.
 var codexKnownModels = []Model{
+	{ID: "gpt-5.4-mini", Object: "model", OwnedBy: "openai"},
 	{ID: "gpt-5.3-codex", Object: "model", OwnedBy: "openai"},
 	{ID: "gpt-5.4", Object: "model", OwnedBy: "openai"},
 	{ID: "gpt-5.2-codex", Object: "model", OwnedBy: "openai"},
@@ -309,225 +334,204 @@ func (p *CodexProvider) ListModels(ctx context.Context) (*ModelList, error) {
 	if err := p.EnsureAuthenticated(ctx); err != nil {
 		return nil, err
 	}
-	return p.cache.GetOrFetch(func() (*ModelList, error) {
-		return p.fetchModels(ctx)
-	})
+	return p.cache.GetOrFetch(func() (*ModelList, error) { return p.fetchModels(ctx) })
 }
 
-// fetchModels returns the known-models list (device_code JWT lacks
-// api.model.read scope, so we never call the upstream /models endpoint).
 func (p *CodexProvider) fetchModels(_ context.Context) (*ModelList, error) {
 	return p.knownModelList(), nil
 }
 
-// knownModelList returns the canonical Codex model list, merging the hardcoded
-// known models with any additional entries from routing.model_map.
+func (p *CodexProvider) InvalidateModelCache() {
+	p.cache.Invalidate()
+}
+
 func (p *CodexProvider) knownModelList() *ModelList {
 	now := time.Now().Unix()
 	seen := make(map[string]bool, len(codexKnownModels))
 	models := make([]Model, 0, len(codexKnownModels))
-	for _, m := range codexKnownModels {
-		m.Created = now
-		seen[m.ID] = true
-		models = append(models, m)
+	for _, model := range codexKnownModels {
+		model.Created = now
+		seen[model.ID] = true
+		models = append(models, model)
 	}
-	// Also include any routing.model_map entries targeting codex.
 	for modelID, entry := range p.cfg.Routing.ModelMap {
-		if ProviderID(entry.Provider) == ProviderCodex && !seen[modelID] {
-			models = append(models, Model{
-				ID:      modelID,
-				Object:  "model",
-				Created: now,
-				OwnedBy: "openai",
-			})
+		bareModel, prefixProvider, hasPrefix := StripModelPrefix(modelID)
+		if ProviderID(entry.Provider) != ProviderCodex && (!hasPrefix || prefixProvider != ProviderCodex) {
+			continue
 		}
+		if seen[bareModel] {
+			continue
+		}
+		models = append(models, Model{ID: bareModel, Object: "model", Created: now, OwnedBy: "openai"})
+		seen[bareModel] = true
 	}
-	ml := &ModelList{Object: "list", Data: models}
-	return ml
+	return &ModelList{Object: "list", Data: models}
 }
 
-// ProxyRequest proxies chat or embeddings requests upstream.
-// ChatGPT / device_code mode sends to chatgpt.com/backend-api/responses
-// with the chatgpt-account-id header; api_key mode sends to api.openai.com/v1.
+// ProxyRequest executes Chat Completions, native Responses, or embeddings.
 func (p *CodexProvider) ProxyRequest(
 	ctx context.Context,
 	w http.ResponseWriter,
 	r *http.Request,
 	body []byte,
-	cap Capability,
+	capability Capability,
 ) error {
-	if err := p.EnsureAuthenticated(ctx); err != nil {
-		log.Printf("[codex] auth failed: %v", err)
-		return fmt.Errorf("codex auth: %w", err)
-	}
-	if !p.cb.canExecute() {
-		log.Printf("[codex] circuit breaker OPEN — rejecting request")
-		return fmt.Errorf("codex circuit breaker is open")
-	}
-
 	p.mu.Lock()
-	accounts := p.cfg.Providers.Codex.Accounts
-	maxAttempts := 1
-	if len(accounts) > 1 {
-		maxAttempts = len(accounts)
+	maxAccountAttempts := len(p.cfg.Providers.Codex.Accounts)
+	if maxAccountAttempts < 1 {
+		maxAccountAttempts = 1
 	}
 	p.mu.Unlock()
 
-	var lastResp *http.Response
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		token, accountID, chatgpt := p.authCredentials()
-
-		// Embeddings — classic Platform API endpoint (both modes).
-		if cap == CapabilityEmbeddings {
-			return p.proxyClassic(ctx, w, r, body, "/embeddings", token)
+	for accountAttempt := 0; accountAttempt < maxAccountAttempts; accountAttempt++ {
+		if err := p.EnsureAuthenticated(ctx); err != nil {
+			return err
+		}
+		if !p.cb.canExecute() {
+			return newProviderError(ProviderCodex, ProviderErrorUnavailable, http.StatusServiceUnavailable, true, "Codex circuit breaker is open")
+		}
+		credential := p.selectedCredential()
+		token, accountID, chatgpt := credential.token, credential.accountID, credential.chatgpt
+		if token == "" {
+			return newProviderError(ProviderCodex, ProviderErrorAuthRequired, http.StatusUnauthorized, false, "Codex credential is empty")
 		}
 
-		// Chat: choose the transport-specific request builder.
-		streaming := isStreamingRequest(body)
+		if capability == CapabilityEmbeddings {
+			if chatgpt {
+				return newProviderError(ProviderCodex, ProviderErrorUnsupported, http.StatusBadRequest, false, "embeddings require OpenAI Platform API-key mode")
+			}
+			return p.proxyClassic(ctx, w, body, "/embeddings", token)
+		}
+		if capability != CapabilityChat && capability != CapabilityResponses {
+			return newProviderError(ProviderCodex, ProviderErrorUnsupported, http.StatusBadRequest, false, "unsupported Codex capability %q", capability)
+		}
 
-		var (
-			responsesBody []byte
-			includeUsage  bool
-			upstreamURL   string
-		)
+		nativeResponses := capability == CapabilityResponses
+		var upstreamBody []byte
+		var clientWantsStream bool
+		var includeUsage bool
+		var upstreamURL string
+		var buildErr error
 		if chatgpt {
-			upstreamURL = defaultChatGPTBaseURL + "responses"
-			var err error
-			responsesBody, includeUsage, err = buildChatGPTCodexRequest(body)
-			if err != nil {
-				log.Printf("[codex] chatgpt request build failed: %v — falling back to classic", err)
-				return p.proxyClassic(ctx, w, r, body, "/chat/completions", token)
+			upstreamURL = p.chatGPTBaseURL() + "responses"
+			if nativeResponses {
+				upstreamBody, clientWantsStream, buildErr = buildChatGPTNativeResponsesRequest(body)
+			} else {
+				upstreamBody, includeUsage, buildErr = buildChatGPTCodexRequest(body)
+				clientWantsStream = isStreamingRequest(body)
 			}
 		} else {
 			upstreamURL = defaultPlatformBaseURL + "/responses"
-			var err error
-			responsesBody, includeUsage, err = buildPlatformResponsesRequest(body)
+			if nativeResponses {
+				upstreamBody, clientWantsStream, buildErr = buildPlatformNativeResponsesRequest(body)
+			} else {
+				upstreamBody, includeUsage, buildErr = buildPlatformResponsesRequest(body)
+				clientWantsStream = isStreamingRequest(body)
+			}
+		}
+		if buildErr != nil {
+			return newProviderError(ProviderCodex, ProviderErrorInvalidRequest, http.StatusBadRequest, false, "build upstream request: %v", buildErr)
+		}
+
+		var response *http.Response
+		var requestErr error
+		for authAttempt := 0; authAttempt < 2; authAttempt++ {
+			request, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewBuffer(upstreamBody))
 			if err != nil {
-				log.Printf("[codex] platform request build failed: %v — falling back to classic", err)
-				return p.proxyClassic(ctx, w, r, body, "/chat/completions", token)
+				return err
 			}
+			if chatgpt {
+				setChatGPTHeaders(request, token, accountID)
+			} else {
+				setPlatformHeaders(request, token)
+			}
+			if p.proxyExecutor != nil {
+				response, _, requestErr = p.proxyExecutor(ctx, request, upstreamBody, capability)
+			} else {
+				response, requestErr = makeRequestWithRetry(sharedHTTPClient, request, upstreamBody)
+			}
+			if requestErr != nil {
+				p.cb.onFailure()
+				return newProviderError(ProviderCodex, ProviderErrorTransport, http.StatusBadGateway, true, "Codex upstream request failed: %v", requestErr)
+			}
+			if response.StatusCode == http.StatusUnauthorized && chatgpt && authAttempt == 0 {
+				response.Body.Close()
+				if refreshErr := p.forceRefreshAccount(credential.index); refreshErr != nil {
+					return newProviderError(ProviderCodex, ProviderErrorAuthRequired, http.StatusUnauthorized, false, "Codex authentication expired: %v", refreshErr)
+				}
+				p.mu.Lock()
+				refreshed := p.credentialAtLocked(credential.index)
+				p.mu.Unlock()
+				token, accountID = refreshed.token, refreshed.accountID
+				continue
+			}
+			break
 		}
-		log.Printf("[codex] proxying chat → %s (body %d bytes, stream=%v, include_usage=%v, mode=%s, attempt=%d/%d)",
-			upstreamURL, len(responsesBody), streaming, includeUsage,
-			map[bool]string{true: "chatgpt", false: "api_key"}[chatgpt], attempt+1, maxAttempts)
+		if response == nil {
+			return newProviderError(ProviderCodex, ProviderErrorTransport, http.StatusBadGateway, true, "Codex returned no response")
+		}
 
-		req, err := http.NewRequestWithContext(ctx, "POST",
-			upstreamURL, bytes.NewBuffer(responsesBody))
-		if err != nil {
-			return err
-		}
-		if chatgpt {
-			setChatGPTHeaders(req, token, accountID)
-		} else {
-			setPlatformHeaders(req, token)
-		}
-
-		var resp *http.Response
-		if p.proxyExecutor != nil {
-			resp, _, err = p.proxyExecutor(ctx, req, responsesBody, cap)
-		} else {
-			resp, err = makeRequestWithRetry(sharedHTTPClient, req, responsesBody)
-		}
-		if err != nil {
-			log.Printf("[codex] upstream error: %v", err)
-			p.cb.onFailure()
-			return err
-		}
-
-		log.Printf("[codex] upstream responded HTTP %d (Content-Type: %s)",
-			resp.StatusCode, resp.Header.Get("Content-Type"))
-
-		isLimit, limitReason := isAccountLimitSignal(resp)
-		if isLimit && maxAttempts > 1 {
-			log.Printf("[codex] account limit signal (%s) — advancing to next account", limitReason)
-			resp.Body.Close()
-			lastResp = resp
+		limited, reason := isAccountLimitSignal(response)
+		if limited && maxAccountAttempts > 1 {
 			p.mu.Lock()
-			advanced := p.advanceCodexAccount()
+			advanced := p.advanceCodexAccountFrom(credential.index)
 			p.mu.Unlock()
-			if !advanced {
-				log.Printf("[codex] all accounts exhausted")
-				break
+			if advanced {
+				log.Printf("[codex] account limit signal (%s); advancing account", reason)
+				response.Body.Close()
+				continue
 			}
-			continue
 		}
 
-		if resp.StatusCode < 500 {
-			p.cb.onSuccess()
-		} else {
-			log.Printf("[codex] upstream 5xx error — circuit breaker failure")
+		if response.StatusCode >= 500 {
 			p.cb.onFailure()
+		} else {
+			p.cb.onSuccess()
 		}
-
-		return handleResponsesAPIResponse(w, resp, streaming, chatgpt, includeUsage)
+		if nativeResponses {
+			return handleNativeResponsesAPIResponse(w, response, clientWantsStream, chatgpt)
+		}
+		return handleResponsesAPIResponse(w, response, clientWantsStream, chatgpt, includeUsage)
 	}
-
-	// All accounts exhausted — forward last rate-limit response.
-	if lastResp != nil {
-		log.Printf("[codex] all accounts exhausted, forwarding last %d response", lastResp.StatusCode)
-		w.WriteHeader(lastResp.StatusCode)
-		return nil
-	}
-	return fmt.Errorf("codex: all accounts exhausted with no upstream response")
+	return newProviderError(ProviderCodex, ProviderErrorRateLimit, http.StatusTooManyRequests, true, "all Codex accounts are rate limited")
 }
 
-// proxyClassic sends a request to a classic OpenAI Platform endpoint
-// (embeddings or chat/completions fallback).
-func (p *CodexProvider) proxyClassic(
-	ctx context.Context,
-	w http.ResponseWriter,
-	_ *http.Request,
-	body []byte,
-	path string,
-	token string,
-) error {
+// proxyClassic is used only with Platform API-key credentials.
+func (p *CodexProvider) proxyClassic(ctx context.Context, w http.ResponseWriter, body []byte, path, token string) error {
 	upstreamURL := defaultPlatformBaseURL + path
-	log.Printf("[codex] proxying classic → %s (body %d bytes)", upstreamURL, len(body))
-
-	req, err := http.NewRequestWithContext(ctx, "POST",
-		upstreamURL, bytes.NewBuffer(body))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewBuffer(body))
 	if err != nil {
 		return err
 	}
-	setPlatformHeaders(req, token)
-
-	resp, err := makeRequestWithRetry(sharedHTTPClient, req, body)
+	setPlatformHeaders(request, token)
+	response, err := makeRequestWithRetry(sharedHTTPClient, request, body)
 	if err != nil {
-		log.Printf("[codex] upstream error: %v", err)
 		p.cb.onFailure()
-		return err
+		return newProviderError(ProviderCodex, ProviderErrorTransport, http.StatusBadGateway, true, "Platform upstream request failed: %v", err)
 	}
-	defer resp.Body.Close()
-
-	log.Printf("[codex] upstream responded HTTP %d (Content-Type: %s)",
-		resp.StatusCode, resp.Header.Get("Content-Type"))
-
-	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-		peekBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		log.Printf("[codex] upstream %d response: %s",
-			resp.StatusCode, string(peekBody))
-		resp.Body = io.NopCloser(
-			io.MultiReader(bytes.NewReader(peekBody), resp.Body))
+	defer response.Body.Close()
+	if response.StatusCode >= 400 && response.StatusCode < 500 {
+		log.Printf("[codex] Platform upstream rejected request with HTTP %d", response.StatusCode)
 	}
-
-	if resp.StatusCode < 500 {
-		p.cb.onSuccess()
+	if response.StatusCode >= 500 {
+		p.cb.onFailure()
 	} else {
-		log.Printf("[codex] upstream 5xx error — circuit breaker failure")
-		p.cb.onFailure()
+		p.cb.onSuccess()
 	}
-	return streamResponse(w, resp)
+	return streamResponse(w, response)
 }
 
-// Health returns the provider's authentication state.
 func (p *CodexProvider) Health(_ context.Context) ProviderHealth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	auth := p.authState()
+	if isAPIKeyMode(auth.Mode) {
+		key, _, err := resolveCodexAPIKey(auth)
+		return ProviderHealth{Authenticated: err == nil && key != "", CanRefresh: false}
+	}
 	authenticated := auth.AccessToken != ""
 	if auth.ExpiresAt > 0 {
 		authenticated = authenticated && auth.ExpiresAt > time.Now().Unix()
 	}
-	hasRefresh := auth.RefreshToken != ""
-	return ProviderHealth{Authenticated: authenticated, CanRefresh: hasRefresh}
+	return ProviderHealth{Authenticated: authenticated, CanRefresh: auth.RefreshToken != ""}
 }

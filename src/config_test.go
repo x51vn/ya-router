@@ -1,10 +1,12 @@
-package main
+package yarouter
 
 import (
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
+
+	configschema "github.com/duvu/ya-router/internal/config"
 )
 
 func TestDefaultConfig(t *testing.T) {
@@ -36,6 +38,58 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if cfg.Timeouts.HTTPClient != 300 {
 		t.Errorf("HTTPClient timeout = %d, want 300", cfg.Timeouts.HTTPClient)
+	}
+}
+
+func TestGetConfigPath_UsesConfigPathEnv(t *testing.T) {
+	old := configPathOverride
+	configPathOverride = ""
+	defer func() { configPathOverride = old }()
+
+	targetDir := filepath.Join(t.TempDir(), "override")
+	target := filepath.Join(targetDir, "config.json")
+	t.Setenv("YA_ROUTER_CONFIG_PATH", target)
+	t.Setenv("YA_ROUTER_CONFIG_DIR", "/dev/null/should-not-be-used")
+
+	got, err := getConfigPath()
+	if err != nil {
+		t.Fatalf("getConfigPath: %v", err)
+	}
+	if got != target {
+		t.Fatalf("config path = %q, want %q", got, target)
+	}
+	info, err := os.Stat(targetDir)
+	if err != nil {
+		t.Fatalf("config dir not created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("config dir is not a directory: %s", targetDir)
+	}
+}
+
+func TestGetConfigPath_UsesConfigDirEnv(t *testing.T) {
+	old := configPathOverride
+	configPathOverride = ""
+	defer func() { configPathOverride = old }()
+
+	targetDir := filepath.Join(t.TempDir(), "config-dir")
+	t.Setenv("YA_ROUTER_CONFIG_DIR", targetDir)
+	t.Setenv("YA_ROUTER_CONFIG_PATH", "")
+
+	got, err := getConfigPath()
+	if err != nil {
+		t.Fatalf("getConfigPath: %v", err)
+	}
+	want := filepath.Join(targetDir, configFileName)
+	if got != want {
+		t.Fatalf("config path = %q, want %q", got, want)
+	}
+	info, err := os.Stat(targetDir)
+	if err != nil {
+		t.Fatalf("config dir not created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("config dir is not a directory: %s", targetDir)
 	}
 }
 
@@ -208,6 +262,16 @@ func TestSaveAndLoadConfig(t *testing.T) {
 	if err := saveConfig(cfg); err != nil {
 		t.Fatalf("saveConfig: %v", err)
 	}
+	info, err := os.Stat(testConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("config permissions = %o, want 600", got)
+	}
+	if leftovers, err := filepath.Glob(testConfigPath + ".tmp-*"); err != nil || len(leftovers) != 0 {
+		t.Fatalf("temporary config files after save = %v (err=%v)", leftovers, err)
+	}
 
 	loaded, err := loadConfig()
 	if err != nil {
@@ -285,6 +349,72 @@ func TestLoadConfig_MissingFile(t *testing.T) {
 	}
 	if cfg.Port != 7071 {
 		t.Errorf("Port = %d, want 7071 (default)", cfg.Port)
+	}
+}
+
+func TestLoadConfig_DoesNotMaskUnreadableState(t *testing.T) {
+	old := configPathOverride
+	configPathOverride = t.TempDir() // opening a directory is not a missing file
+	defer func() { configPathOverride = old }()
+
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("loadConfig returned defaults for unreadable state")
+	}
+}
+
+func TestRuntimeCredentialPersistenceMergesLatestConfig(t *testing.T) {
+	old := configPathOverride
+	configPathOverride = filepath.Join(t.TempDir(), "config.json")
+	defer func() { configPathOverride = old }()
+
+	latest := defaultConfig()
+	latest.Providers.Copilot.Accounts = []CopilotAccount{{
+		ID: "acct-copilot", Label: "primary", Auth: CopilotAuthState{GitHubToken: "github", CopilotToken: "old-copilot"},
+	}}
+	latest.Providers.Codex.Accounts = []CodexAccount{{
+		ID: "acct-codex", Label: "primary", Auth: CodexAuthState{Mode: "chatgpt", AccessToken: "latest-codex"},
+	}}
+	latest.Routing.DefaultModel = "operator-model"
+	if err := saveConfig(latest); err != nil {
+		t.Fatal(err)
+	}
+
+	providerSnapshot := configschema.Clone(latest)
+	providerSnapshot.Providers.Copilot.Accounts[0].Auth.CopilotToken = "refreshed-copilot"
+	providerSnapshot.Providers.Codex.Accounts[0].Auth.AccessToken = "stale-codex"
+	providerSnapshot.Routing.DefaultModel = "stale-model"
+	if err := persistCopilotRuntimeAccount(providerSnapshot, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Providers.Copilot.Accounts[0].Auth.CopilotToken; got != "refreshed-copilot" {
+		t.Fatalf("Copilot token = %q", got)
+	}
+	if got := loaded.Providers.Codex.Accounts[0].Auth.AccessToken; got != "latest-codex" {
+		t.Fatalf("Codex token was overwritten: %q", got)
+	}
+	if got := loaded.Routing.DefaultModel; got != "operator-model" {
+		t.Fatalf("routing config was overwritten: %q", got)
+	}
+}
+
+func TestAccountIDsRemainStableAcrossNormalization(t *testing.T) {
+	copilot := CopilotProviderConfig{Accounts: []CopilotAccount{{Label: "primary"}}}
+	normalizeCopilotAccounts(&copilot)
+	first := copilot.Accounts[0].ID
+	normalizeCopilotAccounts(&copilot)
+	if first == "" || copilot.Accounts[0].ID != first {
+		t.Fatalf("Copilot account ID is not stable: %q -> %q", first, copilot.Accounts[0].ID)
+	}
+
+	codex := CodexProviderConfig{Accounts: []CodexAccount{{Label: "primary"}}}
+	normalizeCodexAccounts(&codex)
+	if codex.Accounts[0].ID == "" || codex.Accounts[0].ID == first {
+		t.Fatalf("Codex account ID is invalid: %q", codex.Accounts[0].ID)
 	}
 }
 

@@ -1,3 +1,3 @@
-module github.com/x51vn/github-copilot-svcs
+module github.com/duvu/ya-router
 
-go 1.21
+go 1.22

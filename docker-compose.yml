@@ -1,26 +1,32 @@
 services:
-  github-copilot-svcs:
+  ya-router:
     build:
       context: .
       dockerfile: Dockerfile
-    image: docker.x51.vn/dev/github-copilot-svcs:latest
-    container_name: github-copilot-svcs
+    image: docker.x51.vn/dev/ya-router:latest
+    container_name: ya-router
     restart: unless-stopped
+    networks:
+      - openstock-net
+    env_file:
+      - ../.env
     ports:
       - "7071:7071"
     volumes:
-      - ./config:/home/appuser/.local/share/github-copilot-svcs
+      - /home/beou/.local/share/github-copilot-svcs:/home/appuser/.local/share/github-copilot-svcs
     environment:
       - PORT=7071
+      - YA_ROUTER_CONFIG_DIR=/home/appuser/.local/share/github-copilot-svcs
+      - YA_ROUTER_CONFIG_PATH=/home/appuser/.local/share/github-copilot-svcs/config.json
+      - YA_ROUTER_LISTEN_ADDRESS=0.0.0.0
     healthcheck:
       test: ["CMD", "curl", "-fsSL", "http://localhost:7071/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
-    networks:
-      - x51-network
 
 networks:
-  x51-network:
-    driver: bridge
+  openstock-net:
+    name: openstock_default
+    external: true

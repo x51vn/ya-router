@@ -1,138 +1,35 @@
 // config.go — application configuration with V0→V1 migration.
-package main
+package yarouter
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/user"
 	"path/filepath"
+	"strings"
+	"sync"
+
+	configschema "github.com/duvu/ya-router/internal/config"
 )
 
 const currentConfigVersion = 1
 
-// RoutingConfig controls how the model router dispatches requests.
-type RoutingConfig struct {
-	DefaultModel          string                   `json:"default_model"`
-	DefaultProvider       string                   `json:"default_provider"`
-	ShowUnavailableModels bool                     `json:"show_unavailable_models"`
-	ModelMap              map[string]ModelMapEntry `json:"model_map,omitempty"`
-}
-
-// ModelMapEntry explicitly maps a model name to a provider and optional upstream alias.
-type ModelMapEntry struct {
-	Provider      string `json:"provider"`
-	UpstreamModel string `json:"upstream_model,omitempty"`
-}
-
-// CopilotAuthState holds persisted Copilot authentication state.
-type CopilotAuthState struct {
-	Mode         string `json:"mode"`
-	GitHubToken  string `json:"github_token,omitempty"`
-	CopilotToken string `json:"copilot_token,omitempty"`
-	ExpiresAt    int64  `json:"expires_at,omitempty"`
-	RefreshIn    int64  `json:"refresh_in,omitempty"`
-}
-
-// CopilotAccount is one entry in the Copilot account pool.
-// Label uniquely identifies the account for CLI operations.
-// LastLimitedAt is the Unix timestamp when this account was last rate-limited;
-// used to enforce the per-account cooldown window.
-type CopilotAccount struct {
-	Label         string           `json:"label"`
-	Auth          CopilotAuthState `json:"auth"`
-	LastLimitedAt int64            `json:"last_limited_at,omitempty"`
-}
-
-// CopilotProviderConfig holds config for the GitHub Copilot provider.
-//
-// Accounts is the multi-account pool. If Accounts is empty but Auth is
-// non-zero, the service promotes Auth to Accounts[0] (label "primary")
-// automatically for backward compatibility.
-//
-// AccountCooldownSeconds is how long (in seconds) a rate-limited account
-// is skipped before being considered healthy again. Default 300.
-type CopilotProviderConfig struct {
-	Enabled                bool             `json:"enabled"`
-	Auth                   CopilotAuthState `json:"auth"`
-	Accounts               []CopilotAccount `json:"accounts,omitempty"`
-	AccountCooldownSeconds int              `json:"account_cooldown_seconds,omitempty"`
-	AllowedModels          []string         `json:"allowed_models"`
-}
-
-// CodexAuthState holds auth configuration and persisted token state
-// for the OpenAI Codex provider.
-//
-// Mode selects the transport and credential source:
-//   - "chatgpt" / "device_code" / "chatgpt_device_auth": ChatGPT backend.
-//     Reads credentials from the official Codex auth store (~/.codex/auth.json).
-//   - "api_key": OpenAI Platform API with a user-supplied API key.
-type CodexAuthState struct {
-	Mode         string `json:"mode"`
-	APIKey       string `json:"api_key,omitempty"`
-	AccessToken  string `json:"access_token,omitempty"`
-	RefreshToken string `json:"refresh_token,omitempty"`
-	ExpiresAt    int64  `json:"expires_at,omitempty"`
-	AccountID    string `json:"account_id,omitempty"`
-}
-
-// CodexAccount is one entry in the Codex account pool.
-// Label uniquely identifies the account for CLI operations.
-// LastLimitedAt is the Unix timestamp when this account was last rate-limited;
-// used to enforce the per-account cooldown window.
-type CodexAccount struct {
-	Label         string         `json:"label"`
-	Auth          CodexAuthState `json:"auth"`
-	LastLimitedAt int64          `json:"last_limited_at,omitempty"`
-}
-
-// CodexProviderConfig holds config for the OpenAI Codex provider.
-//
-// Accounts is the multi-account pool. If Accounts is empty but Auth.Mode is
-// non-empty, the service promotes Auth to Accounts[0] (label "primary")
-// automatically for backward compatibility.
-//
-// AccountCooldownSeconds is how long (in seconds) a rate-limited account
-// is skipped before being considered healthy again. Default 300.
-type CodexProviderConfig struct {
-	Enabled                bool           `json:"enabled"`
-	Auth                   CodexAuthState `json:"auth"`
-	Accounts               []CodexAccount `json:"accounts,omitempty"`
-	AccountCooldownSeconds int            `json:"account_cooldown_seconds,omitempty"`
-	AllowedModels          []string       `json:"allowed_models"`
-	ChatGPTBaseURL         string         `json:"chatgpt_base_url,omitempty"`
-}
-
-// ProvidersConfig groups all provider configurations.
-type ProvidersConfig struct {
-	Copilot CopilotProviderConfig `json:"copilot"`
-	Codex   CodexProviderConfig   `json:"codex"`
-}
-
-// TimeoutsConfig holds all timeout values (seconds).
-type TimeoutsConfig struct {
-	HTTPClient      int `json:"http_client"`
-	ServerRead      int `json:"server_read"`
-	ServerWrite     int `json:"server_write"`
-	ServerIdle      int `json:"server_idle"`
-	ProxyContext    int `json:"proxy_context"`
-	CircuitBreaker  int `json:"circuit_breaker"`
-	KeepAlive       int `json:"keep_alive"`
-	TLSHandshake    int `json:"tls_handshake"`
-	DialTimeout     int `json:"dial_timeout"`
-	IdleConnTimeout int `json:"idle_conn_timeout"`
-}
-
-// Config is the top-level application configuration (V1 schema).
-type Config struct {
-	Port          int             `json:"port"`
-	ConfigVersion int             `json:"config_version"`
-	EnablePprof   bool            `json:"enable_pprof"`
-	Routing       RoutingConfig   `json:"routing"`
-	Providers     ProvidersConfig `json:"providers"`
-	Timeouts      TimeoutsConfig  `json:"timeouts"`
-}
+type RoutingConfig = configschema.Routing
+type ModelMapEntry = configschema.ModelMapEntry
+type CopilotAuthState = configschema.CopilotAuthState
+type CopilotAccount = configschema.CopilotAccount
+type CopilotProviderConfig = configschema.CopilotProvider
+type CodexAuthState = configschema.CodexAuthState
+type CodexAccount = configschema.CodexAccount
+type CodexProviderConfig = configschema.CodexProvider
+type KiloProviderConfig = configschema.KiloProvider
+type ProvidersConfig = configschema.Providers
+type TimeoutsConfig = configschema.Timeouts
+type Config = configschema.Config
 
 // legacyV0Config is used only for reading and migrating pre-V1 config files.
 type legacyV0Config struct {
@@ -171,14 +68,34 @@ const (
 const (
 	configDirName  = ".local/share/github-copilot-svcs"
 	configFileName = "config.json"
+	configPathEnv  = "YA_ROUTER_CONFIG_PATH"
+	configDirEnv   = "YA_ROUTER_CONFIG_DIR"
 )
 
 // configPathOverride lets tests redirect config I/O to a temp path.
 var configPathOverride string
 
+// configWriteMu serializes all in-process config writes. YA-TUI-03 will add the
+// cross-process daemon lock and revisions; this guard prevents provider refresh
+// callbacks in the current process from sharing or replacing the same temp file.
+var configWriteMu sync.Mutex
+
 func getConfigPath() (string, error) {
 	if configPathOverride != "" {
 		return configPathOverride, nil
+	}
+	if customPath := strings.TrimSpace(os.Getenv(configPathEnv)); customPath != "" {
+		if err := os.MkdirAll(filepath.Dir(customPath), 0o700); err != nil {
+			return "", err
+		}
+		return customPath, nil
+	}
+	if customDir := strings.TrimSpace(os.Getenv(configDirEnv)); customDir != "" {
+		dir := filepath.Join(customDir, configFileName)
+		if err := os.MkdirAll(customDir, 0o700); err != nil {
+			return "", err
+		}
+		return dir, nil
 	}
 	usr, err := user.Current()
 	if err != nil {
@@ -199,7 +116,10 @@ func loadConfig() (*Config, error) {
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		return defaultConfig(), nil
+		if os.IsNotExist(err) {
+			return defaultConfig(), nil
+		}
+		return nil, fmt.Errorf("open config: %w", err)
 	}
 	defer file.Close()
 
@@ -310,6 +230,8 @@ func defaultConfig() *Config {
 	// allowed_models left empty = allow all models from upstream
 	cfg.Providers.Codex.Enabled = false
 	cfg.Providers.Codex.Auth.Mode = "device_code"
+	cfg.Providers.Kilo.Enabled = false
+	cfg.Providers.Kilo.AllowAnonymous = true
 	setDefaultTimeouts(cfg)
 	return cfg
 }
@@ -345,16 +267,49 @@ func applyConfigDefaults(cfg *Config) {
 // This ensures single-account configs remain valid without operator changes.
 func normalizeCopilotAccounts(c *CopilotProviderConfig) {
 	if len(c.Accounts) == 0 && c.Auth.GitHubToken != "" {
-		c.Accounts = []CopilotAccount{{Label: "primary", Auth: c.Auth}}
+		c.Accounts = []CopilotAccount{{ID: stableAccountID("copilot", "primary"), Label: "primary", Auth: c.Auth}}
 		c.Auth = CopilotAuthState{}
 	}
+	ensureCopilotAccountIDs(c.Accounts)
 }
 
 func normalizeCodexAccounts(c *CodexProviderConfig) {
 	if len(c.Accounts) == 0 && (c.Auth.AccessToken != "" || c.Auth.APIKey != "") {
-		c.Accounts = []CodexAccount{{Label: "primary", Auth: c.Auth}}
+		c.Accounts = []CodexAccount{{ID: stableAccountID("codex", "primary"), Label: "primary", Auth: c.Auth}}
 		c.Auth = CodexAuthState{}
 	}
+	ensureCodexAccountIDs(c.Accounts)
+}
+
+func ensureCopilotAccountIDs(accounts []CopilotAccount) {
+	seen := make(map[string]int, len(accounts))
+	for index := range accounts {
+		if accounts[index].ID != "" {
+			continue
+		}
+		label := strings.TrimSpace(accounts[index].Label)
+		occurrence := seen[label]
+		seen[label]++
+		accounts[index].ID = stableAccountID("copilot", fmt.Sprintf("%s\x00%d", label, occurrence))
+	}
+}
+
+func ensureCodexAccountIDs(accounts []CodexAccount) {
+	seen := make(map[string]int, len(accounts))
+	for index := range accounts {
+		if accounts[index].ID != "" {
+			continue
+		}
+		label := strings.TrimSpace(accounts[index].Label)
+		occurrence := seen[label]
+		seen[label]++
+		accounts[index].ID = stableAccountID("codex", fmt.Sprintf("%s\x00%d", label, occurrence))
+	}
+}
+
+func stableAccountID(provider, identity string) string {
+	digest := sha256.Sum256([]byte(provider + "\x00" + identity))
+	return "acct_" + hex.EncodeToString(digest[:12])
 }
 
 // setDefaultTimeouts fills zero-valued timeout fields with sensible defaults.
@@ -394,16 +349,32 @@ func setDefaultTimeouts(cfg *Config) {
 
 // saveConfig writes cfg to disk atomically with 0600 permissions.
 func saveConfig(cfg *Config) error {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+	return saveConfigLocked(cfg)
+}
+
+func saveConfigLocked(cfg *Config) error {
 	path, err := getConfigPath()
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	tmp := f.Name()
+	keepTemp := true
+	defer func() {
+		_ = f.Close()
+		if keepTemp {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if err := f.Chmod(0o600); err != nil {
+		return err
+	}
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(cfg); err != nil {
@@ -412,10 +383,83 @@ func saveConfig(cfg *Config) error {
 	if err := f.Sync(); err != nil {
 		return err
 	}
+	if err := f.Close(); err != nil {
+		return err
+	}
 	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("rename temp config: %w", err)
 	}
+	keepTemp = false
+	directory, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open config directory: %w", err)
+	}
+	defer directory.Close()
+	if err := directory.Sync(); err != nil {
+		return fmt.Errorf("sync config directory: %w", err)
+	}
 	return nil
+}
+
+// persistCopilotRuntimeAccount merges only runtime-owned authentication and
+// cooldown state into the latest config. Provider instances hold immutable
+// runtime config snapshots, so writing their whole snapshot would overwrite
+// unrelated configuration or credentials refreshed by another provider.
+func persistCopilotRuntimeAccount(source *Config, accountIndex int) error {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+	latest, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if len(source.Providers.Copilot.Accounts) == 0 {
+		latest.Providers.Copilot.Auth = source.Providers.Copilot.Auth
+		return saveConfigLocked(latest)
+	}
+	if accountIndex < 0 || accountIndex >= len(source.Providers.Copilot.Accounts) {
+		return fmt.Errorf("persist Copilot account: invalid account index %d", accountIndex)
+	}
+	sourceAccount := source.Providers.Copilot.Accounts[accountIndex]
+	for index := range latest.Providers.Copilot.Accounts {
+		if sameAccount(sourceAccount.ID, sourceAccount.Label, latest.Providers.Copilot.Accounts[index].ID, latest.Providers.Copilot.Accounts[index].Label) {
+			latest.Providers.Copilot.Accounts[index].Auth = sourceAccount.Auth
+			latest.Providers.Copilot.Accounts[index].LastLimitedAt = sourceAccount.LastLimitedAt
+			return saveConfigLocked(latest)
+		}
+	}
+	return fmt.Errorf("persist Copilot account %q: account no longer exists", sourceAccount.ID)
+}
+
+func persistCodexRuntimeAccount(source *Config, accountIndex int) error {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+	latest, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if len(source.Providers.Codex.Accounts) == 0 {
+		latest.Providers.Codex.Auth = source.Providers.Codex.Auth
+		return saveConfigLocked(latest)
+	}
+	if accountIndex < 0 || accountIndex >= len(source.Providers.Codex.Accounts) {
+		return fmt.Errorf("persist Codex account: invalid account index %d", accountIndex)
+	}
+	sourceAccount := source.Providers.Codex.Accounts[accountIndex]
+	for index := range latest.Providers.Codex.Accounts {
+		if sameAccount(sourceAccount.ID, sourceAccount.Label, latest.Providers.Codex.Accounts[index].ID, latest.Providers.Codex.Accounts[index].Label) {
+			latest.Providers.Codex.Accounts[index].Auth = sourceAccount.Auth
+			latest.Providers.Codex.Accounts[index].LastLimitedAt = sourceAccount.LastLimitedAt
+			return saveConfigLocked(latest)
+		}
+	}
+	return fmt.Errorf("persist Codex account %q: account no longer exists", sourceAccount.ID)
+}
+
+func sameAccount(sourceID, sourceLabel, candidateID, candidateLabel string) bool {
+	if sourceID != "" && candidateID != "" {
+		return sourceID == candidateID
+	}
+	return sourceLabel != "" && sourceLabel == candidateLabel
 }
 
 // loadDefaultConfigFromExample loads a default config from config.example.json if it exists.
@@ -470,6 +514,9 @@ func mergeConfigs(existing *Config, defaults *Config, mode ConfigMigrationMode) 
 		}
 		if merged.Providers.Copilot.AllowedModels == nil {
 			merged.Providers.Copilot.AllowedModels = defaults.Providers.Copilot.AllowedModels
+		}
+		if merged.Providers.Kilo.AllowedModels == nil {
+			merged.Providers.Kilo.AllowedModels = defaults.Providers.Kilo.AllowedModels
 		}
 		mergeTimeouts(&merged.Timeouts, &defaults.Timeouts)
 		return &merged

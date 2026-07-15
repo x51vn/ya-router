@@ -1,82 +1,20 @@
-// Package main provides the GitHub Copilot proxy service.
-// provider.go defines the Provider interface and shared types.
-package main
+// provider.go keeps source compatibility while provider contracts live in an
+// importable internal package.
+package yarouter
 
-import (
-	"context"
-	"net/http"
-	"time"
-)
+import providerpkg "github.com/duvu/ya-router/internal/provider"
 
-// ProviderID is the machine-readable identifier for a backend provider.
-type ProviderID string
+type ProviderID = providerpkg.ID
+type Capability = providerpkg.Capability
+type ProviderHealth = providerpkg.Health
+type Provider = providerpkg.Provider
 
 const (
-	ProviderCopilot ProviderID = "copilot"
-	ProviderCodex   ProviderID = "codex"
+	ProviderCopilot = providerpkg.Copilot
+	ProviderCodex   = providerpkg.Codex
+	ProviderKilo    = providerpkg.Kilo
+
+	CapabilityChat       = providerpkg.CapabilityChat
+	CapabilityResponses  = providerpkg.CapabilityResponses
+	CapabilityEmbeddings = providerpkg.CapabilityEmbeddings
 )
-
-// Capability describes a request type that a provider may support.
-type Capability string
-
-const (
-	CapabilityChat       Capability = "chat"
-	CapabilityEmbeddings Capability = "embeddings"
-)
-
-// ProviderHealth summarises a provider's current operational state.
-type ProviderHealth struct {
-	Authenticated bool      `json:"authenticated"`
-	CanRefresh    bool      `json:"can_refresh"`
-	LastError     string    `json:"last_error,omitempty"`
-	LastRefreshAt time.Time `json:"last_refresh_at,omitempty"`
-}
-
-// Provider is the abstraction every backend implementation must satisfy.
-// Auth, model discovery, routing, header policy, and retry policy live
-// inside each provider implementation; proxy.go must not know about
-// provider-specific details.
-type Provider interface {
-	// ID returns the machine-readable identifier for this provider.
-	ID() ProviderID
-
-	// Name returns the human-readable display name.
-	Name() string
-
-	// Capabilities lists the request types this provider supports.
-	Capabilities() []Capability
-
-	// EnsureAuthenticated ensures the provider has a valid credential,
-	// refreshing or re-authenticating as needed.
-	EnsureAuthenticated(ctx context.Context) error
-
-	// ListModels returns the filtered list of models for this provider.
-	// Implementations must apply provider-specific allowed_models filtering.
-	ListModels(ctx context.Context) (*ModelList, error)
-
-	// ProxyRequest executes a proxied request for the given capability
-	// and writes the full response to w.  body is the request payload
-	// with the model field already resolved by the router.
-	ProxyRequest(
-		ctx context.Context,
-		w http.ResponseWriter,
-		r *http.Request,
-		body []byte,
-		capability Capability,
-	) error
-
-	// Health returns the provider's current health snapshot.
-	Health(ctx context.Context) ProviderHealth
-}
-
-// FreeChatProxyProvider is an optional interface for providers that want to
-// own chat-model selection themselves instead of relying on router.Resolve.
-type FreeChatProxyProvider interface {
-	ProxyFreeChatRequest(
-		ctx context.Context,
-		w http.ResponseWriter,
-		r *http.Request,
-		body []byte,
-		requestedModel string,
-	) error
-}

@@ -37,3 +37,11 @@ context_portal/context.db
 context_portal/logs/*.log
 context_portal/**/__pycache__/
 context_portal/**/*.pyc
+
+# Omo session continuation artifacts (local, regenerated automatically)
+.omo/
+
+# Compiled build output
+/ya-router
+/ya-routerd
+/ya

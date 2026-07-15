@@ -1,5 +1,5 @@
 // model_cache.go — TTL-based model list cache to avoid repeated upstream calls.
-package main
+package yarouter
 
 import (
 	"log"
@@ -92,4 +92,14 @@ func (c *ModelCache) Age() time.Duration {
 		return -1
 	}
 	return time.Since(c.fetched)
+}
+
+func cloneModelList(ml *ModelList) *ModelList {
+	if ml == nil {
+		return nil
+	}
+	return &ModelList{
+		Object: ml.Object,
+		Data:   append([]Model(nil), ml.Data...),
+	}
 }

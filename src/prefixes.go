@@ -1,70 +1,26 @@
-// prefixes.go — provider-namespaced model ID prefix helpers.
-//
-// All models returned from /v1/models carry a provider-specific prefix so
-// clients can target a provider deterministically:
-//
-//	gc-<id>   →  GitHub Copilot
-//	oc-<id>   →  OpenAI Codex
-//
-// The prefix is a proxy-internal naming convention only; it is stripped before
-// requests are forwarded to the upstream provider API.
-package main
+// prefixes.go preserves the existing public helpers over internal routing.
+package yarouter
 
-import "strings"
+import routingpkg "github.com/duvu/ya-router/internal/routing"
 
 const (
-	// CopilotModelPrefix is the namespace prefix for GitHub Copilot models.
-	CopilotModelPrefix = "gc-"
-	// CodexModelPrefix is the namespace prefix for OpenAI Codex models.
-	CodexModelPrefix = "oc-"
+	CopilotModelPrefix = routingpkg.CopilotModelPrefix
+	CodexModelPrefix   = routingpkg.CodexModelPrefix
+	KiloModelPrefix    = routingpkg.KiloModelPrefix
 )
 
-// ProviderPrefix returns the model ID prefix for the given provider.
-// Returns an empty string for unrecognised providers.
 func ProviderPrefix(providerID ProviderID) string {
-	switch providerID {
-	case ProviderCopilot:
-		return CopilotModelPrefix
-	case ProviderCodex:
-		return CodexModelPrefix
-	default:
-		return ""
-	}
+	return routingpkg.ProviderPrefix(providerID)
 }
 
-// ProviderOwnedBy returns the canonical "owned_by" value for a provider.
 func ProviderOwnedBy(providerID ProviderID) string {
-	switch providerID {
-	case ProviderCopilot:
-		return "github-copilot"
-	case ProviderCodex:
-		return "openai"
-	default:
-		return "openai"
-	}
+	return routingpkg.ProviderOwnedBy(providerID)
 }
 
-// AddModelPrefix returns the model ID with the provider's namespace prefix
-// prepended.  If the model already starts with the correct prefix it is
-// returned unchanged.  If the provider has no prefix, the bare ID is returned.
 func AddModelPrefix(providerID ProviderID, modelID string) string {
-	prefix := ProviderPrefix(providerID)
-	if prefix == "" || strings.HasPrefix(modelID, prefix) {
-		return modelID
-	}
-	return prefix + modelID
+	return routingpkg.AddModelPrefix(providerID, modelID)
 }
 
-// StripModelPrefix removes a known provider prefix from modelID and returns
-// the bare ID, the identified provider, and true.  If no known prefix is found,
-// the original modelID, an empty ProviderID, and false are returned.
-func StripModelPrefix(modelID string) (bare string, provider ProviderID, ok bool) {
-	switch {
-	case strings.HasPrefix(modelID, CopilotModelPrefix):
-		return modelID[len(CopilotModelPrefix):], ProviderCopilot, true
-	case strings.HasPrefix(modelID, CodexModelPrefix):
-		return modelID[len(CodexModelPrefix):], ProviderCodex, true
-	default:
-		return modelID, "", false
-	}
+func StripModelPrefix(modelID string) (bare string, providerID ProviderID, ok bool) {
+	return routingpkg.StripModelPrefix(modelID)
 }

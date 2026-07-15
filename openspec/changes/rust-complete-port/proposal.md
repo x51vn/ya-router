@@ -1,46 +1,41 @@
 ## Why
 
-The Rust port (OpenSpec change `port-project-to-rust`) completed the workspace scaffold, config/migration parity, CLI surface, HTTP stub server, model list, and routing resolution (tasks 1.1–1.3, 2.1, 2.2). The remaining work — async HTTP serving, Copilot/Codex auth runtimes, SSE streaming proxy, parity tests, benchmarks, Docker/CI packaging, and Go retirement — is substantial enough to warrant a new focused change that defines Rust completion as the primary delivery rather than an additive parallel track.
+`ya-router` currently has one production implementation: the hardened Go runtime under `src/`. No Rust workspace or Rust runtime is present in the repository. The earlier version of this change incorrectly described a partially completed Rust port and carried forward names and behaviors that conflict with the current `ya-router` contracts.
 
-The user has also requested a consistency redesign: the current `rust/` workspace uses stdlib-only TCP + sync HTTP, which must be replaced with an async Rust runtime (tokio + axum/hyper + reqwest) to actually deliver on the performance motivation. Without this, the Rust port would be slower and less concurrent than the existing Go service for streaming workloads.
+This change therefore defines a future Rust port from a clean starting point. The port is additive until it proves behavioral parity with Go. It must not weaken routing determinism, credential isolation, error semantics, protocol fidelity, or deployment safeguards.
 
 ## What Changes
 
-- **Replace stdlib sync TCP server in `rust/src/server.rs` with tokio + axum async HTTP runtime** — enables real concurrent request handling and SSE streaming.
-- **Add reqwest-based async HTTP client and SSE proxy transport in `rust/src/proxy.rs`** — implements upstream proxying for both streaming and non-streaming chat responses.
-- **Implement Rust Copilot provider runtime** in `rust/src/providers/copilot.rs` — GitHub device-flow auth, token refresh, free-model rotation for chat, embeddings support.
-- **Implement Rust Codex provider runtime** in `rust/src/providers/codex.rs` — api_key path (env/config/official store), ChatGPT/device-code path (official Codex auth store with config fallback), transport selection by auth mode.
-- **Implement Rust request/response transform layer** in `rust/src/transforms.rs` — mirrors Go `src/transform.go` normalization.
-- **Implement Rust parity test harness** — shared test vectors covering HTTP, routing, config migration, and CLI behavior against Go reference.
-- **Define and run benchmarks** — latency/throughput/memory against Go for concurrent SSE chat and model-list workloads.
-- **Add Rust Docker/CI packaging** — multi-stage Dockerfile for the Rust binary; Makefile targets for Docker build/push; CI job for Rust alongside the existing Go job.
-- **Retire Go source after parity and benchmark gates pass** — `src/` removed, `rust/` promoted to primary, binary name normalized to `github-copilot-svcs`.
-- **Consistency redesign** — rename `rust/src/main.rs` binary target to `github-copilot-svcs`, consolidate module structure, update all build/run/deploy references.
-- **BREAKING: Primary runtime language changes from Go to Rust** once cutover task is executed.
+- Create a new Rust implementation under `rust/` without changing the Go build or deployment path.
+- Use an async HTTP stack suitable for concurrent streaming requests.
+- Reproduce every public endpoint: model listing, Chat Completions, native Responses, embeddings, and all health endpoints.
+- Reproduce the provider registry and every provider present in the Go runtime at the start of implementation and again at cutover.
+- Keep the official Codex credential store read-only and preserve account-pool credential ownership.
+- Preserve upstream HTTP status, selected headers, non-streaming bodies, and SSE event fidelity.
+- Reject unsupported request fields explicitly instead of silently removing them.
+- Build executable parity tests and representative benchmarks before any production cutover.
+- Keep the binary, image, and service name `ya-router`.
+- Retire Go only in a separate, explicit cutover after parity, security, performance, packaging, and rollback gates pass.
 
 ## Capabilities
 
 ### New Capabilities
-- `rust-async-runtime`: Tokio + axum HTTP server and reqwest proxy transport replacing sync stdlib TCP implementation.
-- `rust-provider-runtime`: Real Copilot and Codex auth/request/response cycles implemented in Rust.
-- `rust-parity-validation`: Shared parity test harness and benchmark suite comparing Rust and Go behavior.
-- `rust-production-packaging`: Dockerfile, CI job, Makefile targets, and deployment guidance for Rust binary in production.
-- `go-retirement`: Removal of Go `src/` after gates pass, promotion of Rust as the sole runtime.
+
+- `rust-async-runtime`: additive Rust server and upstream HTTP transport.
+- `rust-provider-runtime`: provider abstraction and provider implementations matching Go behavior.
+- `rust-parity-validation`: shared fixtures and side-by-side contract tests.
+- `rust-production-packaging`: non-production Rust image and CI validation before cutover.
+- `go-retirement`: separately gated removal of Go after Rust is production-proven.
 
 ### Modified Capabilities
-- `rust-runtime-port`: Async runtime requirement replaces sync stdlib TCP requirement; auth behavior changes from "not implemented" to fully implemented.
-- `rust-port-validation`: Benchmark workloads and success thresholds become concrete and blocking; parity tests become executable, not just planned.
+
+- `rust-runtime-port`: starts from an empty Rust workspace rather than a pre-existing skeleton.
+- `rust-port-validation`: all security and protocol invariants in `AGENTS.md` are blocking acceptance criteria.
 
 ## Impact
 
-- `rust/Cargo.toml` — adds `tokio`, `axum`, `hyper`, `reqwest`, and `tower` dependencies.
-- `rust/src/server.rs`, `rust/src/main.rs` — rewritten for tokio async.
-- `rust/src/proxy.rs` — new file implementing SSE/non-streaming upstream proxying.
-- `rust/src/providers/copilot.rs`, `rust/src/providers/codex.rs` — full auth/request/response runtime.
-- `rust/src/transforms.rs` — full request/response normalization.
-- `Makefile` — Rust docker-build, docker-run targets; update help text.
-- `Dockerfile.rust` — new file for Rust multi-stage image.
-- `.github/workflows/ci-cd.yml` — Rust CI job added; Go CI job preserved until retirement task.
-- `src/` — **removed** at the retirement task.
-- `README.md`, `docs/` operator docs — updated for Rust primary runtime.
-- `AGENTS.md` — updated for Rust build/test/run commands and Go retirement.
+- New `rust/` workspace and Rust-specific test fixtures.
+- Additive Rust validation in `Makefile` and CI; existing Go validation remains blocking.
+- Optional `Dockerfile.rust` or equivalent non-production image during the transition.
+- No config migration, auth-store migration, public endpoint change, provider removal, binary rename, or production deployment change is allowed before cutover.
+- `src/`, `go.mod`, the Go image, and the Go deployment path remain authoritative until every cutover gate passes.

@@ -1,4 +1,4 @@
-package main
+package yarouter
 
 import (
 	"context"
@@ -7,142 +7,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
-
-func TestProcessProxyRequest_ChatUsesCopilotFreePathBeforeRouter(t *testing.T) {
-	registry := NewProviderRegistry()
-	var gotRequested string
-	var gotBodyModel string
-	registry.Register(&mockProvider{
-		id:     ProviderCopilot,
-		name:   "Mock Copilot",
-		caps:   []Capability{CapabilityChat},
-		health: ProviderHealth{Authenticated: true},
-		freeChatProxyFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request, body []byte, requestedModel string) error {
-			gotRequested = requestedModel
-			gotBodyModel = extractModelFromBody(body)
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"ok":true}`))
-			return nil
-		},
-	})
-
-	cfg := defaultConfig()
-	cfg.Routing.DefaultProvider = string(ProviderCodex)
-	router := NewModelRouter(registry, cfg.Routing)
-
-	req := httptest.NewRequest("POST", "/v1/chat/completions", io.NopCloser(strings.NewReader(`{"model":"claude-sonnet-4.6","messages":[{"role":"user","content":"hi"}]}`)))
-	rr := httptest.NewRecorder()
-
-	err := processProxyRequest(registry, router, cfg, rr, req, context.Background())
-	if err != nil {
-		t.Fatalf("processProxyRequest: %v", err)
-	}
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rr.Code)
-	}
-	if gotRequested != "claude-sonnet-4.6" {
-		t.Fatalf("requestedModel = %q, want claude-sonnet-4.6", gotRequested)
-	}
-	if gotBodyModel != "claude-sonnet-4.6" {
-		t.Fatalf("body model = %q, want claude-sonnet-4.6", gotBodyModel)
-	}
-}
-
-func TestCopilotProvider_ProxyFreeChatRequest_RotatesAndIgnoresClientModel(t *testing.T) {
-	provider := NewCopilotProvider(defaultConfig())
-	provider.freeModelResolver = func(context.Context) ([]Model, error) {
-		return []Model{
-			{ID: "gpt-4.1", Name: "GPT-4.1"},
-			{ID: "gpt-4o", Name: "GPT-4o"},
-		}, nil
-	}
-
-	var attempted []string
-	provider.proxyExecutor = func(_ context.Context, _ *http.Request, body []byte, _ Capability) (*http.Response, string, error) {
-		attempted = append(attempted, extractModelFromBody(body))
-		resp := &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
-		}
-		resp.Header.Set("Content-Type", "application/json")
-		return resp, "", nil
-	}
-
-	makeRequest := func() *http.Request {
-		return httptest.NewRequest("POST", "/v1/chat/completions", io.NopCloser(strings.NewReader(`{"model":"claude-sonnet-4.6","messages":[{"role":"user","content":"hi"}]}`)))
-	}
-
-	rr1 := httptest.NewRecorder()
-	if err := provider.ProxyFreeChatRequest(context.Background(), rr1, makeRequest(), []byte(`{"model":"claude-sonnet-4.6","messages":[{"role":"user","content":"hi"}]}`), "claude-sonnet-4.6"); err != nil {
-		t.Fatalf("first ProxyFreeChatRequest: %v", err)
-	}
-	rr2 := httptest.NewRecorder()
-	if err := provider.ProxyFreeChatRequest(context.Background(), rr2, makeRequest(), []byte(`{"model":"claude-sonnet-4.6","messages":[{"role":"user","content":"hi"}]}`), "claude-sonnet-4.6"); err != nil {
-		t.Fatalf("second ProxyFreeChatRequest: %v", err)
-	}
-
-	want := []string{"gpt-4.1", "gpt-4o"}
-	if !reflect.DeepEqual(attempted, want) {
-		t.Fatalf("attempted models = %v, want %v", attempted, want)
-	}
-}
-
-func TestCopilotProvider_ProxyFreeChatRequest_ShiftsOnFailure(t *testing.T) {
-	provider := NewCopilotProvider(defaultConfig())
-	provider.freeModelResolver = func(context.Context) ([]Model, error) {
-		return []Model{
-			{ID: "gpt-4.1", Name: "GPT-4.1"},
-			{ID: "gpt-4o", Name: "GPT-4o"},
-			{ID: "gpt-5-mini", Name: "GPT-5 mini"},
-		}, nil
-	}
-
-	var attempted []string
-	provider.proxyExecutor = func(_ context.Context, _ *http.Request, body []byte, _ Capability) (*http.Response, string, error) {
-		modelID := extractModelFromBody(body)
-		attempted = append(attempted, modelID)
-		resp := &http.Response{
-			Header: make(http.Header),
-		}
-		resp.Header.Set("Content-Type", "application/json")
-		if modelID == "gpt-4.1" {
-			resp.StatusCode = http.StatusServiceUnavailable
-			resp.Body = io.NopCloser(strings.NewReader(`{"error":"temporary failure"}`))
-			return resp, "", nil
-		}
-		resp.StatusCode = http.StatusOK
-		resp.Body = io.NopCloser(strings.NewReader(`{"model":"` + modelID + `"}`))
-		return resp, "", nil
-	}
-
-	rr := httptest.NewRecorder()
-	err := provider.ProxyFreeChatRequest(
-		context.Background(),
-		rr,
-		httptest.NewRequest("POST", "/v1/chat/completions", io.NopCloser(strings.NewReader(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}`))),
-		[]byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}`),
-		"gpt-5.4",
-	)
-	if err != nil {
-		t.Fatalf("ProxyFreeChatRequest: %v", err)
-	}
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rr.Code)
-	}
-
-	want := []string{"gpt-4.1", "gpt-4o"}
-	if !reflect.DeepEqual(attempted, want) {
-		t.Fatalf("attempted models = %v, want %v", attempted, want)
-	}
-}
 
 // TestCoalesceRequest_ConcurrentWaitersReceiveSameResult verifies that
 // all concurrent callers of CoalesceRequest for the same key receive
@@ -422,7 +291,7 @@ func TestModelsHandler_MultipleProviders(t *testing.T) {
 	for _, m := range ml.Data {
 		ids[m.ID] = true
 	}
-	if !ids["gc-gpt-4"] || !ids["oc-o1-preview"] {
+	if !ids["github/gpt-4"] || !ids["codex/o1-preview"] {
 		t.Errorf("missing expected models, got IDs: %v", ids)
 	}
 }
@@ -575,6 +444,40 @@ func TestCircuitBreaker_OpenClosedTransition(t *testing.T) {
 	}
 }
 
+func TestCircuitBreaker_HalfOpenAllowsSingleProbe(t *testing.T) {
+	cb := &CircuitBreaker{
+		failureCount:    circuitBreakerFailureThreshold,
+		lastFailureTime: time.Now().Add(-time.Second),
+		state:           CircuitOpen,
+		timeout:         time.Millisecond,
+	}
+
+	const callers = 64
+	start := make(chan struct{})
+	var allowed atomic.Int32
+	var wait sync.WaitGroup
+	wait.Add(callers)
+	for index := 0; index < callers; index++ {
+		go func() {
+			defer wait.Done()
+			<-start
+			if cb.canExecute() {
+				allowed.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wait.Wait()
+
+	if got := allowed.Load(); got != 1 {
+		t.Fatalf("half-open probes allowed = %d, want 1", got)
+	}
+	cb.onFailure()
+	if cb.canExecute() {
+		t.Fatal("failed half-open probe should reopen the circuit")
+	}
+}
+
 // TestCapabilityFromPath tests path to capability mapping.
 func TestCapabilityFromPath(t *testing.T) {
 	tests := []struct {
@@ -619,5 +522,43 @@ func TestWorkerPool_ProcessesJobs(t *testing.T) {
 	wg.Wait()
 	if c := atomic.LoadInt32(&counter); c != 10 {
 		t.Errorf("processed %d jobs, want 10", c)
+	}
+}
+
+func TestWorkerPool_BackpressureHonorsCancellationAndStop(t *testing.T) {
+	pool := NewWorkerPool(1)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	if !pool.Submit(func() {
+		close(started)
+		<-release
+	}) {
+		t.Fatal("first job was rejected")
+	}
+	<-started
+
+	queuedDone := make(chan struct{}, 2)
+	for index := 0; index < 2; index++ {
+		if !pool.Submit(func() { queuedDone <- struct{}{} }) {
+			t.Fatal("queue fill job was rejected")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if pool.SubmitContext(ctx, func() {}) {
+		t.Fatal("saturated pool accepted a job after its context expired")
+	}
+
+	close(release)
+	for index := 0; index < 2; index++ {
+		select {
+		case <-queuedDone:
+		case <-time.After(time.Second):
+			t.Fatal("queued job did not finish")
+		}
+	}
+	pool.Stop()
+	if pool.SubmitContext(context.Background(), func() {}) {
+		t.Fatal("stopped pool accepted a job")
 	}
 }

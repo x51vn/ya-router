@@ -1,4 +1,4 @@
-package main
+package yarouter
 
 import (
 	"encoding/json"

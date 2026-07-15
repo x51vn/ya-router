@@ -1,430 +1,347 @@
-# Configuration Guide
+# ya-router configuration guide
 
-`github-copilot-svcs` is configured via a single JSON file at:
+## Configuration source
 
-```
+The production Go runtime reads:
+
+```text
 ~/.local/share/github-copilot-svcs/config.json
 ```
 
-The service automatically migrates older config versions on startup. Use `config.example.json` in the repo root as a starting point.
+The historical directory name is retained to avoid silently losing existing routing settings and credentials. The file is written atomically with mode `0600`.
 
----
-
-## Table of Contents
-
-1. [Quick Start](#quick-start)
-2. [GitHub Copilot Setup](#github-copilot-setup)
-3. [Copilot Multi-Account Pool](#copilot-multi-account-pool)
-4. [OpenAI Codex Setup](#openai-codex-setup)
-5. [Codex Multi-Account Pool](#codex-multi-account-pool)
-6. [Model IDs and Prefixes](#model-ids-and-prefixes)
-7. [Routing and Model Map](#routing-and-model-map)
-8. [Provider Filtering with allowed_models](#provider-filtering-with-allowed_models)
-9. [Timeouts](#timeouts)
-10. [Troubleshooting](#troubleshooting)
-
----
-
-## Quick Start
+Start from `config.example.json` and run:
 
 ```bash
-# Authenticate with GitHub Copilot
-github-copilot-svcs auth copilot
-
-# Start the proxy
-github-copilot-svcs run
-
-# List available models
-github-copilot-svcs models
+./ya-router config
+./ya-router status
 ```
 
-The proxy listens on port **7071** by default and exposes:
+## Server security environment
 
-| Path | Method | Description |
-|------|--------|-------------|
-| `/v1/models` | GET | List available models |
-| `/v1/chat/completions` | POST | Chat completions (OpenAI-compatible) |
-| `/v1/embeddings` | POST | Embeddings (OpenAI-compatible) |
-| `/health` | GET | Health check |
+Server exposure is intentionally controlled outside the JSON credential file.
 
----
+| Environment variable | Default | Purpose |
+|---|---|---|
+| `YA_ROUTER_LISTEN_ADDRESS` | `127.0.0.1` | Address to bind |
+| `YA_ROUTER_API_KEY` | empty | Inbound proxy credential; mandatory for non-loopback binding |
+| `YA_ROUTER_CORS_ALLOWED_ORIGINS` | empty | Comma-separated browser-origin allowlist |
+| `YA_ROUTER_CODEX_OAUTH_CLIENT_ID` | Codex-compatible default | OAuth client override for managed deployments |
+| `OPENAI_API_KEY` | empty | OpenAI Platform API key |
+| `CODEX_HOME` | `~/.codex` | Read-only source for a legacy/single-account Codex credential import |
+| `KILO_API_KEY` | empty | Kilo Gateway API key; optional for free anonymous models |
+| `KILO_ORG_ID` | empty | Kilo organization context |
+| `KILO_GATEWAY_BASE_URL` | `https://api.kilo.ai/api/gateway` | Full Kilo Gateway base URL override |
 
-## GitHub Copilot Setup
-
-GitHub Copilot uses OAuth device-code flow. No API key is required.
-
-### Authentication
+Examples:
 
 ```bash
-github-copilot-svcs auth copilot
+# Local-only; no inbound proxy key required.
+./ya-router run
+
+# Network deployment; a proxy key is mandatory.
+export YA_ROUTER_LISTEN_ADDRESS=0.0.0.0
+export YA_ROUTER_API_KEY="$(openssl rand -hex 32)"
+export YA_ROUTER_CORS_ALLOWED_ORIGINS='https://app.example.com'
+./ya-router run
 ```
 
-Follow the browser prompt to authorise. Credentials are stored in the runtime config file. Tokens refresh automatically.
+The service refuses to start on a non-loopback address when `YA_ROUTER_API_KEY` is missing.
 
-### Configuration
+## Top-level schema
 
 ```json
-"providers": {
-  "copilot": {
-    "enabled": true,
-    "auth": {
-      "mode": "device_code"
-    },
-    "allowed_models": []
-  }
+{
+  "port": 7071,
+  "config_version": 1,
+  "enable_pprof": false,
+  "routing": {},
+  "providers": {},
+  "timeouts": {}
 }
 ```
 
-**`enabled`** — Set to `true` to activate the Copilot provider.
+### `port`
 
-**`auth.mode`** — Always `"device_code"` for Copilot.
+Listening port. Default: `7071`.
 
-**`allowed_models`** — Accepted by the config parser for schema compatibility, but no longer gates the model list. All models returned by the Copilot API are always exposed. Leave as `[]`.
+### `enable_pprof`
 
-### Notes
+Enables `/debug/pprof/`. The endpoints are still covered by the inbound access policy. Keep this disabled outside controlled diagnostics.
 
-- Copilot chat **ignores the `model` field** from the client. The service rotates across an eligible free-tier pool and falls back on error. This is intentional Copilot behaviour.
-- Embeddings use normal model routing.
-- Run `github-copilot-svcs refresh --provider copilot` to force a token refresh.
-
----
-
-## Copilot Multi-Account Pool
-
-Run multiple Copilot accounts to reduce rate-limit impact. When all model attempts on the active account return 429 or 403 (rate limit), the service automatically advances to the next healthy account.
-
-### Adding a second account
-
-```bash
-github-copilot-svcs auth copilot --account work
-github-copilot-svcs auth copilot --account personal
-```
-
-Each `--account` label is stored as an entry in `providers.copilot.accounts`. Omitting `--account` authenticates the first account (label `"primary"`).
-
-### Config format
+## Routing
 
 ```json
-"providers": {
-  "copilot": {
-    "enabled": true,
-    "accounts": [
-      { "label": "primary", "auth": { "mode": "device_code" } },
-      { "label": "work",    "auth": { "mode": "device_code" } }
-    ],
-    "account_cooldown_seconds": 300
-  }
-}
-```
-
-**`accounts`** — List of Copilot accounts. Leave empty for single-account mode; the service auto-promotes the legacy `auth` field on first load.
-
-**`account_cooldown_seconds`** — How long (in seconds) a rate-limited account is skipped before being retried. Default `300` (5 min).
-
-### Single-account backward compatibility
-
-Existing configs with `providers.copilot.auth.github_token` are automatically promoted to `accounts[0]` (label `"primary"`) at load time. No manual migration is required.
-
-### Viewing pool status
-
-```bash
-github-copilot-svcs status
-```
-
-Shows per-account auth state and cooldown remaining when 2 or more accounts are configured.
-
----
-
-## OpenAI Codex Setup
-
-Codex supports two authentication modes:
-
-| Mode | Credential source | Use when |
-|------|------------------|----------|
-| `device_code` / `chatgpt` | ChatGPT account (device OAuth) | You have a ChatGPT Plus/Teams account |
-| `api_key` | `OPENAI_API_KEY` env var or config | You have an OpenAI Platform API key |
-
-### ChatGPT / Device-code authentication
-
-```bash
-github-copilot-svcs auth codex
-```
-
-This runs the OpenAI device-code OAuth flow. Credentials are persisted in the official Codex auth store at `~/.codex/auth.json`. The proxy config retains only `mode` and `enabled`; no bearer tokens are written to the config file.
-
-```json
-"providers": {
-  "codex": {
-    "enabled": true,
-    "auth": {
-      "mode": "device_code"
-    },
-    "allowed_models": []
-  }
-}
-```
-
-### API key authentication
-
-Set the environment variable before starting the service:
-
-```bash
-export OPENAI_API_KEY=sk-...
-github-copilot-svcs run
-```
-
-Or configure `api_key_env` to name an alternate environment variable:
-
-```json
-"providers": {
-  "codex": {
-    "enabled": true,
-    "auth": {
-      "mode": "api_key",
-      "api_key_env": "OPENAI_API_KEY"
-    },
-    "allowed_models": []
-  }
-}
-```
-
-**`enabled`** — Set to `true` to activate the Codex provider.
-
-**`auth.mode`** — `"device_code"` for ChatGPT-backed auth, `"api_key"` for OpenAI Platform key.
-
-**`auth.api_key_env`** — Only used in `api_key` mode. Names the environment variable that holds the key. Defaults to `OPENAI_API_KEY`.
-
-**`allowed_models`** — Accepted by the config parser for schema compatibility, but no longer gates the model list. All Codex models are always exposed. Leave as `[]`.
-
-### Notes
-
-- Run `github-copilot-svcs auth codex --api-key sk-...` to store an API key in the config instead of using the environment variable.
-- Run `github-copilot-svcs refresh --provider codex` to refresh a ChatGPT-backed token.
-- The `status` command shows which credential source is active and whether the token is expired.
-
----
-
-## Codex Multi-Account Pool
-
-Run multiple Codex accounts to reduce rate-limit impact. When all request attempts on the active account return 429 or 403 (rate limit), the service automatically advances to the next healthy account.
-
-### Adding accounts
-
-```bash
-# ChatGPT / device-code accounts
-github-copilot-svcs auth codex --account personal
-github-copilot-svcs auth codex --account work
-
-# API key accounts
-github-copilot-svcs auth codex --api-key sk-... --account platform-key
-```
-
-Each `--account` label is stored as an entry in `providers.codex.accounts`. Omitting `--account` authenticates or updates the first account (label `"primary"`).
-
-### Config format
-
-```json
-"providers": {
-  "codex": {
-    "enabled": true,
-    "accounts": [
-      {
-        "label": "personal",
-        "auth": { "mode": "chatgpt" }
-      },
-      {
-        "label": "platform-key",
-        "auth": { "mode": "api_key", "api_key_env": "OPENAI_API_KEY_2" }
+{
+  "routing": {
+    "default_model": "gpt-5-mini",
+    "default_provider": "copilot",
+    "show_unavailable_models": false,
+    "model_map": {
+      "research-model": {
+        "provider": "codex",
+        "upstream_model": "gpt-5.4"
       }
-    ],
-    "account_cooldown_seconds": 300
-  }
-}
-```
-
-**`accounts`** — List of Codex accounts. Leave empty for single-account mode; the service auto-promotes the legacy `auth` field on first load.
-
-**`account_cooldown_seconds`** — How long (in seconds) a rate-limited account is skipped before being retried. Default `300` (5 min).
-
-### Credential storage
-
-- **ChatGPT / device-code accounts**: credentials for each account are stored in the proxy config under that account's `auth` pool entry. The official Codex auth store (`~/.codex/auth.json`) is used as the initial auth-handshake channel but pool entries are persisted in config.
-- **API key accounts**: the key is stored in the account's `auth.api_key` field in config, or resolved at runtime from `auth.api_key_env`.
-
-### Single-account backward compatibility
-
-Existing configs with `providers.codex.auth` populated are automatically promoted to `accounts[0]` (label `"primary"`) at load time. No manual migration is required.
-
-### Viewing pool status
-
-```bash
-github-copilot-svcs status
-```
-
-Shows per-account authentication state and cooldown remaining when 2 or more accounts are configured.
-
----
-
-## Model IDs and Prefixes
-
-Every model exposed by `/v1/models` carries a provider-namespace prefix so clients can target a specific backend deterministically.
-
-| Provider | Prefix | Example model ID |
-|----------|--------|-----------------|
-| GitHub Copilot | `gc-` | `gc-gpt-4o`, `gc-claude-3.5-sonnet` |
-| OpenAI Codex | `oc-` | `oc-gpt-5.3-codex`, `oc-o3-mini` |
-
-**Client usage:**
-
-```bash
-curl http://localhost:7071/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gc-gpt-4o","messages":[{"role":"user","content":"hello"}]}'
-```
-
-**Router behaviour:**
-
-- A prefixed model ID like `gc-gpt-4o` is resolved to the Copilot provider, which then routes to `gpt-4o` upstream.
-- A bare model ID like `gpt-4o` is accepted for backward compatibility. The router will try to discover which provider exposes it. If both providers expose the same bare ID, you must disambiguate with a prefix or a `model_map` entry.
-- The prefix is stripped before the request is forwarded upstream, so upstream services always see the bare model name.
-
----
-
-## Routing and Model Map
-
-The `routing` block controls how models are resolved to providers.
-
-```json
-"routing": {
-  "default_model": "gpt-5-mini",
-  "default_provider": "copilot",
-  "show_unavailable_models": false,
-  "model_map": {
-    "text-embedding-3-large": {
-      "provider": "codex"
-    },
-    "gc-gpt-4o": {
-      "provider": "copilot",
-      "upstream_model": "gpt-4o"
-    },
-    "oc-gpt-5.3-codex": {
-      "provider": "codex",
-      "upstream_model": "gpt-5.3-codex"
     }
   }
 }
 ```
 
-**`default_model`** — The model used when a client sends a request without a `model` field. Bare ID; the router resolves it through the default provider.
-
-**`default_provider`** — The provider used when no model is specified and no `model_map` entry matches.
-
-**`show_unavailable_models`** — When `true`, models from unauthenticated providers still appear in `/v1/models`. Useful for debugging.
-
-**`model_map`** — Explicit routing rules. Each key is the model ID clients use; the value specifies which provider to route to and optionally the upstream model name to send.
-
-`model_map` has the highest routing priority. Use it to:
-- Pin a specific model to a specific provider.
-- Map a custom name to an upstream model.
-- Resolve ambiguity when both providers expose a model with the same bare name.
-
-**`upstream_model`** — Optional. If omitted, the key itself (after stripping any known prefix) is sent as the model name to the upstream.
-
 ### Resolution order
 
-1. Exact `model_map` key match.
-2. `model_map` bare-key match (key without prefix).
-3. If the request uses a prefixed model ID (`gc-*` or `oc-*`), route to that provider's catalog.
-4. Discover across provider catalogs. If exactly one provider exposes the model, route there.
-5. If multiple providers expose the same model, return an error asking for disambiguation.
-6. If no model was requested, use `default_provider`.
+1. Exact `model_map` key.
+2. Bare `model_map` key after removing a recognized provider prefix.
+3. Explicit provider prefix.
+4. Provider catalog discovery.
+5. Configured default provider only when the request omitted the model.
 
----
+Explicit prefixes are authoritative:
 
-## Provider Filtering with allowed_models
+| Prefix | Provider |
+|---|---|
+| `github/` | GitHub Copilot |
+| `codex/` | OpenAI Codex |
+| `kilo/` | Kilo AI Gateway |
 
-> **Note:** `allowed_models` no longer gates the model list exposed by providers. The field is accepted by the config parser for backward compatibility but has no effect on which models appear at `/v1/models`. All models from each provider are always returned in full.
+The prefix is removed before forwarding upstream. A model present in multiple providers requires a prefix or `model_map` rule. Unknown explicit bare model names fail. The default provider is used only when the request omitted the model.
 
-The `allowed_models` field may still appear in your config file. It will not cause errors and will be ignored during model listing.
+### `show_unavailable_models`
+
+When false, `/v1/models` hides providers that are not authenticated. Set true only for diagnostics.
+
+## GitHub Copilot provider
 
 ```json
-"providers": {
-  "copilot": {
-    "allowed_models": []
-  },
-  "codex": {
-    "allowed_models": []
+{
+  "providers": {
+    "copilot": {
+      "enabled": true,
+      "auth": {"mode": "device_code"},
+      "accounts": [],
+      "account_cooldown_seconds": 300,
+      "allowed_models": []
+    }
   }
 }
 ```
 
-To control which models a client can use, rely on `routing.model_map` to define explicit routes, or use the provider-prefixed model IDs (`gc-*` for Copilot, `oc-*` for Codex) to target a specific provider deterministically.
+Authenticate:
 
----
+```bash
+./ya-router auth copilot
+./ya-router auth copilot --account work
+```
 
-## Timeouts
+Copilot chat only receives requests selected by `model_map`, a `github/` prefix, or provider catalog discovery. It cannot intercept `codex/*` requests, explicit Codex mappings, or unknown bare model names.
 
-All values are in seconds.
+## Codex provider
+
+Codex has two distinct authentication and transport modes.
+
+### ChatGPT mode
 
 ```json
-"timeouts": {
-  "http_client": 300,
-  "server_read": 30,
-  "server_write": 300,
-  "server_idle": 120,
-  "proxy_context": 300,
-  "circuit_breaker": 30,
-  "keep_alive": 30,
-  "tls_handshake": 10,
-  "dial_timeout": 10,
-  "idle_conn_timeout": 90
+{
+  "providers": {
+    "codex": {
+      "enabled": true,
+      "auth": {"mode": "chatgpt"},
+      "accounts": [],
+      "account_cooldown_seconds": 300,
+      "allowed_models": [],
+      "chatgpt_base_url": "https://chatgpt.com/backend-api/codex/"
+    }
+  }
 }
 ```
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `http_client` | 300 | Total timeout for outbound HTTP requests |
-| `server_read` | 30 | Max time to read the full client request |
-| `server_write` | 300 | Max time to write the full response (covers streaming) |
-| `server_idle` | 120 | Keep-alive idle timeout for client connections |
-| `proxy_context` | 300 | Context deadline for a full proxy round-trip |
-| `circuit_breaker` | 30 | Time before a tripped circuit breaker retries |
-| `keep_alive` | 30 | TCP keep-alive interval for outbound connections |
-| `tls_handshake` | 10 | TLS handshake timeout |
-| `dial_timeout` | 10 | TCP dial timeout for outbound connections |
-| `idle_conn_timeout` | 90 | Max idle time for a pooled outbound connection |
+Authenticate with device OAuth:
 
-For streaming responses, `server_write` and `proxy_context` should be large enough to cover the full stream duration.
+```bash
+./ya-router auth codex
+./ya-router auth codex --account work
+```
 
----
+Properties:
 
-## Troubleshooting
+- backend: ChatGPT Codex Responses;
+- credentials: ya-router config account entry;
+- supported capabilities: chat and native Responses;
+- unsupported capability: embeddings;
+- `401` handling: one refresh and one request retry;
+- official `$CODEX_HOME/auth.json`: read-only fallback import for legacy/single-account use only.
 
-**`/v1/models` returns an empty list**
+The global official Codex store never overrides a populated account-pool entry.
 
-- Check `github-copilot-svcs status` to verify authentication.
-- Run `github-copilot-svcs auth copilot` or `auth codex` to re-authenticate.
-- Set `show_unavailable_models: true` temporarily to see models from unauthenticated providers.
+### API-key mode
 
-**Requests fail with "model unavailable"**
+Use the process environment:
 
-- The model ID may not be exposed by any enabled provider. Run `github-copilot-svcs models` to list available models.
-- Use a prefixed ID (`gc-*` or `oc-*`) to target a specific provider.
-- Add an explicit `model_map` entry to route the model.
+```bash
+export OPENAI_API_KEY=sk-...
+```
 
-**Ambiguity error: "model X is available from multiple providers"**
+or import from stdin:
 
-- Use the prefixed form (`gc-X` or `oc-X`) in the request.
-- Or add a `model_map` entry to pin the model to one provider.
+```bash
+printf '%s\n' "$OPENAI_API_KEY" | ./ya-router auth codex --api-key-stdin
+```
 
-**Token expired / auth errors**
+Properties:
 
-- Run `github-copilot-svcs refresh` to refresh tokens.
-- For Codex ChatGPT mode, re-run `github-copilot-svcs auth codex` if refresh fails.
-- For Codex API key mode, verify the `OPENAI_API_KEY` environment variable is set.
+- backend: `https://api.openai.com/v1`;
+- supported capabilities: chat, native Responses, and embeddings;
+- no OAuth refresh;
+- ChatGPT account metadata is not sent.
 
-**Config not found / defaults used**
+The runtime uses `OPENAI_API_KEY`; `api_key_env` is not part of config version 1.
 
-- The config file is created automatically after the first `auth` command.
-- Copy `config.example.json` to `~/.local/share/github-copilot-svcs/config.json` to pre-populate it.
-- Run `github-copilot-svcs migrate-config --mode merge` to apply any new default fields.
+### Manual bearer-token fallback
+
+```bash
+printf '%s\n' "$CHATGPT_ACCESS_TOKEN" | ./ya-router auth codex --token-stdin
+```
+
+This path is intended for recovery only. Without a refresh token, reauthentication is required when the access token expires.
+
+## Kilo Gateway provider
+
+Kilo is disabled by default. Enable anonymous access to free models with:
+
+```bash
+./ya-router auth kilo
+```
+
+Or configure it directly:
+
+```json
+{
+  "providers": {
+    "kilo": {
+      "enabled": true,
+      "allow_anonymous": true,
+      "organization_id": "",
+      "base_url": "https://api.kilo.ai/api/gateway",
+      "allowed_models": []
+    }
+  }
+}
+```
+
+The provider discovers `GET /models`, forwards Chat Completions to `/chat/completions`, and passes native Responses requests to `/responses`. It intentionally does not advertise embeddings because embeddings are not part of Kilo's documented public Gateway contract.
+
+### Auto Free
+
+Use the client-facing model ID:
+
+```text
+kilo/kilo-auto/free
+```
+
+ya-router removes only its leading `kilo/` namespace and sends `kilo-auto/free` upstream. Without an API key, the catalog and proxy are restricted to IDs marked free by Kilo, IDs ending in `:free`, `openrouter/free`, and `kilo-auto/free`. Paid IDs fail before an upstream request is made.
+
+Anonymous access can be disabled with `"allow_anonymous": false`. For authenticated models, prefer `KILO_API_KEY`; importing through stdin is also supported:
+
+```bash
+printf '%s\n' "$KILO_API_KEY" | ./ya-router auth kilo --api-key-stdin
+```
+
+The inbound ya-router API credential is never forwarded. Kilo requests receive only the server-owned Kilo credential, optional organization ID, and a small allowlist of Kilo task/mode headers.
+
+Auto Free may route requests to providers that log prompts and outputs or use them to improve services. Do not submit confidential, personal, or regulated data through Auto Free.
+
+## Multi-account pools
+
+```json
+{
+  "providers": {
+    "codex": {
+      "enabled": true,
+      "accounts": [
+        {
+          "label": "personal",
+          "auth": {
+            "mode": "chatgpt"
+          }
+        },
+        {
+          "label": "platform",
+          "auth": {
+            "mode": "api_key"
+          }
+        }
+      ],
+      "account_cooldown_seconds": 300
+    }
+  }
+}
+```
+
+Each account owns its own auth state. On an account rate-limit response, the request can advance to the next eligible account. The attempt count is bounded by the number of accounts.
+
+`LastLimitedAt` is persisted for compatibility. The current scheduler uses the configured cooldown duration; richer upstream-reset scheduling remains a future config-version change.
+
+## Structured outputs
+
+For `/v1/chat/completions`, the router maps:
+
+```text
+response_format.json_schema
+    -> text.format.json_schema
+```
+
+It also preserves `tool_choice`, `parallel_tool_calls`, tools, reasoning, and supported metadata. Parameters that cannot be represented by the selected Responses transport return a request error rather than being silently removed.
+
+For callers already using Responses semantics, prefer:
+
+```text
+POST /v1/responses
+```
+
+The native endpoint preserves Responses output and SSE events without converting them into Chat Completions chunks.
+
+## Retry behavior
+
+- Network, `408`, and `5xx` retry is bounded.
+- Unsafe POST requests require an `Idempotency-Key` before retry after uncertain delivery.
+- `429` is handled by account failover rather than blind transport retry.
+- OAuth refresh retries only transient network failures, `429`, and `5xx`.
+- Permanent OAuth `4xx` failures require reauthentication.
+
+## Timeouts
+
+```json
+{
+  "timeouts": {
+    "http_client": 300,
+    "server_read": 30,
+    "server_write": 300,
+    "server_idle": 120,
+    "proxy_context": 300,
+    "circuit_breaker": 30,
+    "keep_alive": 30,
+    "tls_handshake": 10,
+    "dial_timeout": 10,
+    "idle_conn_timeout": 90
+  }
+}
+```
+
+All values are seconds. Long-lived streaming requests must fit within both `http_client` and `proxy_context`.
+
+## Health and operations
+
+```bash
+curl http://127.0.0.1:7071/health/live
+curl http://127.0.0.1:7071/health/ready
+curl http://127.0.0.1:7071/health/providers
+```
+
+`/health/providers` returns only provider ID, name, authentication state, refreshability, and capabilities. It does not return tokens or account IDs.
+
+## Migration notes
+
+- Legacy top-level provider auth is promoted to account label `primary` when required.
+- Existing config path and config version remain supported.
+- ChatGPT tokens previously copied into the official Codex store are no longer written there by ya-router.
+- Existing secret-bearing `--api-key` and `--token` command-line flags have been replaced by stdin flags to prevent process-list and shell-history leakage.

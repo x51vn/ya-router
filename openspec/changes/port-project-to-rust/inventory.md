@@ -1,103 +1,141 @@
 # Go Runtime Parity Inventory
 
+## Current Runtime Status
+
+- The only runtime currently present is Go under `src/`.
+- The production binary, image, and service name are `ya-router`.
+- No `rust/` workspace currently exists.
+- Go remains the reference implementation until an explicit, gated cutover.
+
 ## External HTTP Contract
 
-- `GET /health`
-  - returns JSON with `status`, `service`, and `timestamp`
-  - current implementation lives in `src/server.go`
-- `GET /v1/models`
-  - returns a merged provider model list
-  - skips unavailable providers unless `routing.show_unavailable_models` is enabled
-  - always keeps `routing.model_map` entries visible even when provider discovery fails
-- `POST /v1/chat/completions`
-  - OpenAI-compatible surface
-  - Copilot chat is a special path: client `model` is ignored and Copilot free-model rotation owns upstream model choice
-  - non-Copilot chat resolves through the router by model + capability
-- `POST /v1/embeddings`
-  - OpenAI-compatible surface
-  - resolved through the router by model + capability
+- `GET /v1/models`: merged, provider-prefixed catalog plus visible `routing.model_map` entries.
+- `POST /v1/chat/completions`: OpenAI-compatible Chat Completions surface.
+- `POST /v1/responses`: native Responses surface; native events are not converted to Chat Completions chunks.
+- `POST /v1/embeddings`: embeddings through providers/auth modes that support them.
+- `GET /health` and `GET /health/live`: process liveness.
+- `GET /health/ready`: readiness; unavailable providers can make it return `503`.
+- `GET /health/providers`: redacted provider health and capabilities.
 
 ## CLI Contract
 
-Current dispatcher in `src/main.go` exposes:
+The dispatcher in `src/main.go` exposes:
 
 - `help`
-- `auth [copilot|codex]`
+- `auth [copilot|codex] [--account <label>]`
 - `run|start [--config-migrate merge|none|override]`
 - `migrate-config --mode merge|override`
-- `models [--provider <provider>]`
+- `models [--provider <provider>] [--refresh]`
 - `config`
 - `status`
 - `refresh [--provider <provider>]`
 - `version`
 
-Error style is command-specific and exits non-zero from `main.go`, e.g. `Server failed: %v`, `Refresh failed: %v`.
+Secrets are accepted through environment variables or stdin flags, not raw command-line values.
 
-## Runtime/Auth Paths
+## Runtime and Credential Paths
 
-- Runtime config path: `~/.local/share/github-copilot-svcs/config.json`
-- Codex official auth store: `~/.codex/auth.json` or `$CODEX_HOME/auth.json`
-- Config writes are atomic and use `0600`
-- Codex ChatGPT/device-auth mode treats the official Codex store as primary; config retains mode/enabled state and API-key mode secrets only
+- Compatibility config: `~/.local/share/github-copilot-svcs/config.json` or `YA_ROUTER_CONFIG_PATH`.
+- Config writes are atomic; secret-bearing config uses file mode `0600`.
+- Official Codex store: `~/.codex/auth.json` or `$CODEX_HOME/auth.json`.
+- The official Codex store is read-only import data and is never rewritten by ya-router.
+- Account-pool entries own their credentials; global import data cannot override a selected account.
 
-## Routing And Provider Rules
+## Routing Contract
 
-- Provider abstraction is defined in `src/provider.go`
-- Capabilities are `chat` and `embeddings`
-- Router behavior in `src/router.go`
-  - first checks `routing.model_map`
-  - then provider model discovery
-  - explicit model miss for a requested capability is an error
-  - only omitted-model requests may fall back to `routing.default_provider`
-- `/v1/chat/completions` has a Copilot fast path in `src/proxy.go`
-  - if Copilot is registered and implements free-chat proxying, Copilot handles chat before router resolution
+1. Exact `routing.model_map` entry.
+2. Explicit authoritative provider prefix.
+3. Provider catalog discovery.
+4. Configured default provider only when the request omitted a model.
 
-## Provider-Specific Behavior
+Current prefixes:
 
-### Copilot
+- `github/` → GitHub Copilot.
+- `codex/` → OpenAI Codex.
+- `kilo/` → Kilo AI Gateway.
 
-- Device-flow auth in `src/auth.go`
-- Provider runtime in `src/copilot_provider.go`
-- Supports chat and embeddings
-- Chat uses free-model rotation and can shift to the next eligible model before the response is committed
-- Embeddings normalize request bodies before upstream proxying
+Unknown explicit models fail. Ambiguous bare model names fail. A prefixed request never falls through to another provider. Cross-provider billing fallback is forbidden without a separate accepted specification.
+
+## Capabilities
+
+The shared capability vocabulary is:
+
+- `chat`
+- `responses`
+- `embeddings`
+
+Providers expose only the capabilities their current auth mode can safely serve.
+
+### GitHub Copilot
+
+- Device-flow authentication and provider-owned refresh.
+- Provider runtime: `src/copilot_provider.go`.
+- Deterministic routing to the resolved upstream model.
+- Chat and embeddings behavior are provider-owned.
 
 ### Codex
 
-- Device auth + refresh in `src/codex_auth.go`
-- Provider runtime in `src/codex_provider.go`
-- Supports chat and embeddings
-- Chat transport splits by auth mode:
-  - ChatGPT/device-auth → ChatGPT-backed responses transport
-  - API key → Platform API transport
-- Embeddings always use the classic platform-style endpoint path in provider logic
+- Device auth and refresh: `src/codex_auth.go`.
+- Provider runtime: `src/codex_provider.go`.
+- API-key mode uses OpenAI Platform endpoints.
+- ChatGPT OAuth modes use the ChatGPT Codex Responses backend.
+- ChatGPT mode supports chat and native Responses.
+- Embeddings require API-key mode.
+- A ChatGPT `401` permits at most one refresh and one request retry.
 
-## Build/Test/Deploy Assumptions To Preserve
+### Kilo Gateway
 
-- Go remains the production runtime today
-- Current build target: `go build ... ./src`
-- Current verification order in repo conventions: `make fmt && make vet && make test && make build`
-- CI on `main` still builds/tests Go and triggers container publish + deploy
-- `main` push is production-impacting, so Rust work must remain additive until parity/cutover is proven
+- Provider runtime: `src/kilo_provider.go`.
+- Default backend: `https://api.kilo.ai/api/gateway`.
+- Dynamic model discovery through `GET /models`.
+- Chat Completions and native Responses passthrough; embeddings are not advertised.
+- `KILO_API_KEY` is optional for free anonymous models and takes precedence over config import.
+- Anonymous mode exposes and accepts only free model IDs, including `kilo-auto/free`.
+- Inbound router credentials are never forwarded to Kilo.
+- Kilo status codes and SSE events pass through unchanged.
+- Auto Free carries an explicit warning against confidential, personal, or regulated data.
 
-## Existing Parity-Relevant Tests
+## Protocol and Error Contract
 
-- `src/integration_test.go`
-  - merged `/v1/models` behavior
-  - router resolution behavior
-  - config default auth expectations
-  - Codex auth-source precedence helpers
-- `src/proxy_test.go`
-  - Copilot chat fast path
-  - Copilot free-model rotation and shift-on-failure behavior
-  - request retry/coalescing behavior
+- Chat Completions `response_format` is translated to Responses `text.format` only when representable.
+- Unsupported fields fail explicitly; they are not silently removed.
+- Native Responses requests bypass Chat Completions response conversion.
+- Unknown native Responses events pass through unchanged.
+- SSE error, failed, or incomplete events remain failures.
+- Upstream failure status is preserved; `401`, `403`, and `429` are not logged as successful `200` requests.
+- Unsafe POST retry after uncertain delivery requires `Idempotency-Key`.
+- Provider failures use typed error kinds for invalid request, auth, entitlement, rate limit, unsupported capability, unavailable provider, and transport.
 
-## Safest Initial Rust Slice
+## Server Security Contract
 
-Before porting live provider behavior, the lowest-risk additive slice is:
+- Default bind address is `127.0.0.1`.
+- Non-loopback binding requires `YA_ROUTER_API_KEY`.
+- CORS is disabled unless explicit origins are configured.
+- Health endpoints expose redacted metadata only.
+- Tokens, API keys, device codes, and raw account IDs never appear in logs.
 
-1. create a separate Rust workspace under `rust/`
-2. define explicit Rust modules for CLI, config, server, routing, transforms, and providers
-3. add Rust build/test/fmt/check entrypoints without changing Go build/deploy paths
+## Build and Validation Contract
 
-This keeps production behavior on Go while making the first three OpenSpec tasks measurable.
+- Module target: `./src`.
+- Binary: `ya-router`.
+- Required checks: formatting, `go vet`, race-enabled tests, and production build.
+- Current CI toolchain: Go 1.22.
+- Go validation remains blocking throughout any additive Rust work.
+
+## Parity-Relevant Tests
+
+- `src/integration_test.go`: endpoints, merged model catalog, routing, auth-source and compatibility behavior.
+- `src/proxy_test.go` and `src/proxy_freepool_regression_test.go`: dispatch, status, retry, and free-pool regressions.
+- `src/responses_adapter_test.go`: Chat Completions/Responses conversion and streaming events.
+- `src/hardening_test.go`: security, auth, routing, and transport boundaries.
+- `src/kilo_provider_test.go`: Kilo catalog filtering, credential isolation, status/SSE passthrough, and base-URL policy.
+- Provider-specific and prefix tests alongside production sources.
+
+## Provider Drift Rule
+
+Refresh this inventory twice:
+
+1. immediately before Rust implementation starts;
+2. immediately before production cutover.
+
+Any provider, endpoint, capability, or invariant added to Go between those checkpoints becomes a blocking Rust parity requirement.

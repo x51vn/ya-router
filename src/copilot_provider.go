@@ -1,5 +1,5 @@
 // copilot_provider.go — GitHub Copilot backend provider implementation.
-package main
+package yarouter
 
 import (
 	"bytes"
@@ -68,7 +68,7 @@ func (p *CopilotProvider) authState() *CopilotAuthState {
 }
 
 func (p *CopilotProvider) save() error {
-	return saveConfig(p.cfg)
+	return persistCopilotRuntimeAccount(p.cfg, p.accountCursor)
 }
 
 func (p *CopilotProvider) cooldownSeconds() int64 {
@@ -97,18 +97,33 @@ func (p *CopilotProvider) firstHealthyAccount() int {
 	return 0
 }
 
-// advanceAccount marks the current account as rate-limited, then advances the
-// cursor to the next non-cooldown account in the pool.
-// Returns true if a new healthy account was found, false if all are exhausted.
 func (p *CopilotProvider) advanceAccount() bool {
+	return p.advanceAccountFrom(p.accountCursor)
+}
+
+// advanceAccountFrom records the account that actually served the failed
+// request. Another request may already have moved the shared cursor, so the
+// response path must never assume the current cursor still identifies it.
+// Caller must hold p.mu.
+func (p *CopilotProvider) advanceAccountFrom(failedIndex int) bool {
 	accounts := p.cfg.Providers.Copilot.Accounts
+	if failedIndex < 0 || failedIndex >= len(accounts) {
+		return false
+	}
+	accounts[failedIndex].LastLimitedAt = time.Now().Unix()
 	if len(accounts) <= 1 {
 		return false
 	}
-	accounts[p.accountCursor].LastLimitedAt = time.Now().Unix()
 	size := len(accounts)
-	for i := 1; i < size; i++ {
-		next := (p.accountCursor + i) % size
+	start := p.accountCursor
+	if start == failedIndex {
+		start = (failedIndex + 1) % size
+	}
+	for i := 0; i < size; i++ {
+		next := (start + i) % size
+		if next == failedIndex {
+			continue
+		}
 		if !p.isAccountInCooldown(&accounts[next]) {
 			p.accountCursor = next
 			return true
@@ -160,6 +175,10 @@ func (p *CopilotProvider) ListModels(ctx context.Context) (*ModelList, error) {
 	return raw, nil
 }
 
+func (p *CopilotProvider) InvalidateModelCache() {
+	p.cache.Invalidate()
+}
+
 func (p *CopilotProvider) listRawModels(ctx context.Context) (*ModelList, error) {
 	if err := p.EnsureAuthenticated(ctx); err != nil {
 		return nil, err
@@ -185,7 +204,7 @@ func (p *CopilotProvider) listRawModels(ctx context.Context) (*ModelList, error)
 }
 
 func (p *CopilotProvider) fetchModelsRaw() (*ModelList, error) {
-	token := p.authState().CopilotToken
+	_, token := p.credentialSnapshot()
 	if token == "" {
 		return &ModelList{Object: "list", Data: nil}, nil
 	}
@@ -218,7 +237,7 @@ func (p *CopilotProvider) ProxyRequest(
 	body []byte,
 	cap Capability,
 ) error {
-	resp, embedModel, err := p.executeProxyRequest(ctx, r, body, cap)
+	resp, embedModel, _, err := p.executeProxyRequest(ctx, r, body, cap)
 	if err != nil {
 		return err
 	}
@@ -230,15 +249,16 @@ func (p *CopilotProvider) executeProxyRequest(
 	r *http.Request,
 	body []byte,
 	cap Capability,
-) (*http.Response, string, error) {
+) (*http.Response, string, int, error) {
 	if err := p.EnsureAuthenticated(ctx); err != nil {
 		log.Printf("[copilot] auth failed: %v", err)
-		return nil, "", fmt.Errorf("copilot auth: %w", err)
+		return nil, "", -1, fmt.Errorf("copilot auth: %w", err)
 	}
 	if !p.cb.canExecute() {
 		log.Printf("[copilot] circuit breaker OPEN — rejecting request")
-		return nil, "", fmt.Errorf("copilot circuit breaker is open")
+		return nil, "", -1, fmt.Errorf("copilot circuit breaker is open")
 	}
+	accountIndex, token := p.credentialSnapshot()
 
 	isEmbed := cap == CapabilityEmbeddings
 	embedModel := ""
@@ -256,24 +276,22 @@ func (p *CopilotProvider) executeProxyRequest(
 
 	req, err := http.NewRequestWithContext(ctx, r.Method, upstreamURL, bytes.NewBuffer(body))
 	if err != nil {
-		return nil, "", err
+		return nil, "", accountIndex, err
 	}
-	p.setCopilotHeaders(req, p.authState().CopilotToken, cap)
+	p.setCopilotHeaders(req, token, cap)
 
 	resp, err := makeRequestWithRetry(sharedHTTPClient, req, body)
 	if err != nil {
 		log.Printf("[copilot] upstream error: %v", err)
 		p.cb.onFailure()
-		return nil, "", err
+		return nil, "", accountIndex, err
 	}
 
 	log.Printf("[copilot] upstream responded HTTP %d (Content-Type: %s)",
 		resp.StatusCode, resp.Header.Get("Content-Type"))
 
 	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-		peekBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		log.Printf("[copilot] upstream %d response: %s", resp.StatusCode, string(peekBody))
-		resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(peekBody), resp.Body))
+		log.Printf("[copilot] upstream rejected request with HTTP %d", resp.StatusCode)
 	}
 
 	if resp.StatusCode < 500 {
@@ -283,7 +301,14 @@ func (p *CopilotProvider) executeProxyRequest(
 		p.cb.onFailure()
 	}
 
-	return resp, embedModel, nil
+	return resp, embedModel, accountIndex, nil
+}
+
+func (p *CopilotProvider) credentialSnapshot() (int, string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	index := p.accountCursor
+	return index, p.authState().CopilotToken
 }
 
 func (p *CopilotProvider) writeProxyResponse(
@@ -318,11 +343,12 @@ func (p *CopilotProvider) ProxyFreeChatRequest(
 
 		attempts := p.nextFreeChatAttemptOrder(models)
 		var lastLimitResp *http.Response
+		lastLimitAccountIndex := -1
 		modelExhausted := false
 
 		for i, model := range attempts {
 			patchedBody := patchBodyModel(body, model.ID)
-			resp, embedModel, execErr := p.executeProxy(ctx, r, patchedBody, CapabilityChat)
+			resp, embedModel, accountIndex, execErr := p.executeProxy(ctx, r, patchedBody, CapabilityChat)
 			if execErr != nil {
 				if i == len(attempts)-1 {
 					return execErr
@@ -331,23 +357,24 @@ func (p *CopilotProvider) ProxyFreeChatRequest(
 				continue
 			}
 
-			if isLimit, preview := isAccountLimitSignal(resp); isLimit {
-				log.Printf("[copilot-free] account limit signal from model %q (HTTP %d): %q", model.ID, resp.StatusCode, preview)
-				resp.Body.Close()
+			if isLimit, reason := isAccountLimitSignal(resp); isLimit {
+				log.Printf("[copilot-free] account limit signal from model %q (HTTP %d, reason=%s)", model.ID, resp.StatusCode, reason)
 				lastLimitResp = resp
+				lastLimitAccountIndex = accountIndex
 				modelExhausted = (i == len(attempts)-1)
 				if !modelExhausted {
+					resp.Body.Close()
 					continue
 				}
 				break
 			}
 
-			if shift, preview := shouldShiftToNextCopilotModel(resp); shift {
+			if shift, reason := shouldShiftToNextCopilotModel(resp); shift {
 				if i == len(attempts)-1 {
 					log.Printf("[copilot-free] model %q failed and no more models remain; forwarding final upstream response", model.ID)
 					return p.writeProxyResponse(w, resp, CapabilityChat, embedModel)
 				}
-				log.Printf("[copilot-free] model %q failed with HTTP %d; shifting to next model. body=%q", model.ID, resp.StatusCode, preview)
+				log.Printf("[copilot-free] model %q failed with HTTP %d; shifting to next model (reason=%s)", model.ID, resp.StatusCode, reason)
 				resp.Body.Close()
 				continue
 			}
@@ -360,9 +387,10 @@ func (p *CopilotProvider) ProxyFreeChatRequest(
 
 		if lastLimitResp != nil && modelExhausted {
 			p.mu.Lock()
-			advanced := p.advanceAccount()
+			advanced := p.advanceAccountFrom(lastLimitAccountIndex)
 			p.mu.Unlock()
 			if advanced {
+				lastLimitResp.Body.Close()
 				log.Printf("[copilot-free] all models rate-limited on current account; switching to next account")
 				continue
 			}
@@ -413,9 +441,11 @@ func (p *CopilotProvider) executeProxy(
 	r *http.Request,
 	body []byte,
 	cap Capability,
-) (*http.Response, string, error) {
+) (*http.Response, string, int, error) {
+	accountIndex, _ := p.credentialSnapshot()
 	if p.proxyExecutor != nil {
-		return p.proxyExecutor(ctx, r, body, cap)
+		response, embedModel, err := p.proxyExecutor(ctx, r, body, cap)
+		return response, embedModel, accountIndex, err
 	}
 	return p.executeProxyRequest(ctx, r, body, cap)
 }
@@ -429,7 +459,7 @@ func shouldShiftToNextCopilotModel(resp *http.Response) (bool, string) {
 	case resp.StatusCode == http.StatusRequestTimeout,
 		resp.StatusCode == http.StatusTooManyRequests,
 		resp.StatusCode >= http.StatusInternalServerError:
-		return true, readAndResetResponseBody(resp)
+		return true, "transient_upstream_error"
 	case resp.StatusCode == http.StatusBadRequest,
 		resp.StatusCode == http.StatusNotFound,
 		resp.StatusCode == http.StatusConflict:
@@ -439,7 +469,7 @@ func shouldShiftToNextCopilotModel(resp *http.Response) (bool, string) {
 				strings.Contains(preview, "not available") ||
 				strings.Contains(preview, "not found") ||
 				strings.Contains(preview, "unavailable")) {
-			return true, preview
+			return true, "model_unavailable"
 		}
 	}
 
@@ -451,14 +481,14 @@ func isAccountLimitSignal(resp *http.Response) (bool, string) {
 		return false, ""
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return true, readAndResetResponseBody(resp)
+		return true, "rate_limited"
 	}
 	if resp.StatusCode == http.StatusForbidden {
 		preview := strings.ToLower(readAndResetResponseBody(resp))
 		if strings.Contains(preview, "rate limit") ||
 			strings.Contains(preview, "exceeded") ||
 			strings.Contains(preview, "quota") {
-			return true, preview
+			return true, "quota_exhausted"
 		}
 	}
 	return false, ""
@@ -468,14 +498,28 @@ func readAndResetResponseBody(resp *http.Response) string {
 	if resp == nil || resp.Body == nil {
 		return ""
 	}
-	body, err := io.ReadAll(resp.Body)
+	const previewLimit = 4 * 1024
+	original := resp.Body
+	body, err := io.ReadAll(io.LimitReader(original, previewLimit+1))
+	resp.Body = &replayReadCloser{
+		Reader: io.MultiReader(bytes.NewReader(body), original),
+		closer: original,
+	}
 	if err != nil {
 		return ""
 	}
-	resp.Body.Close()
-	resp.Body = io.NopCloser(bytes.NewReader(body))
+	if len(body) > previewLimit {
+		body = body[:previewLimit]
+	}
 	return string(body)
 }
+
+type replayReadCloser struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (body *replayReadCloser) Close() error { return body.closer.Close() }
 
 func (p *CopilotProvider) setCopilotHeaders(req *http.Request, token string, cap Capability) {
 	req.Header.Set("Authorization", "Bearer "+token)

@@ -10,13 +10,17 @@
       "text-embedding-3-large": {
         "provider": "codex"
       },
-      "gc-gpt-4o": {
+      "github/gpt-4o": {
         "provider": "copilot",
         "upstream_model": "gpt-4o"
       },
-      "oc-gpt-5.3-codex": {
+      "codex/gpt-5.4": {
         "provider": "codex",
-        "upstream_model": "gpt-5.3-codex"
+        "upstream_model": "gpt-5.4"
+      },
+      "kilo/kilo-auto/free": {
+        "provider": "kilo",
+        "upstream_model": "kilo-auto/free"
       }
     }
   },
@@ -33,11 +37,18 @@
     "codex": {
       "enabled": false,
       "auth": {
-        "mode": "device_code",
-        "api_key_env": "OPENAI_API_KEY"
+        "mode": "chatgpt"
       },
       "accounts": [],
       "account_cooldown_seconds": 300,
+      "allowed_models": [],
+      "chatgpt_base_url": "https://chatgpt.com/backend-api/codex/"
+    },
+    "kilo": {
+      "enabled": false,
+      "allow_anonymous": true,
+      "organization_id": "",
+      "base_url": "https://api.kilo.ai/api/gateway",
       "allowed_models": []
     }
   },
