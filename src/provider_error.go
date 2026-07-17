@@ -11,13 +11,14 @@ import (
 type ProviderErrorKind string
 
 const (
-	ProviderErrorInvalidRequest ProviderErrorKind = "invalid_request"
-	ProviderErrorAuthRequired   ProviderErrorKind = "auth_required"
-	ProviderErrorEntitlement    ProviderErrorKind = "entitlement_denied"
-	ProviderErrorRateLimit      ProviderErrorKind = "rate_limited"
-	ProviderErrorUnsupported    ProviderErrorKind = "unsupported_capability"
-	ProviderErrorUnavailable    ProviderErrorKind = "provider_unavailable"
-	ProviderErrorTransport      ProviderErrorKind = "transport_error"
+	ProviderErrorInvalidRequest   ProviderErrorKind = "invalid_request"
+	ProviderErrorAuthRequired     ProviderErrorKind = "auth_required"
+	ProviderErrorEntitlement      ProviderErrorKind = "entitlement_denied"
+	ProviderErrorRateLimit        ProviderErrorKind = "rate_limited"
+	ProviderErrorUnsupported      ProviderErrorKind = "unsupported_capability"
+	ProviderErrorUnavailable      ProviderErrorKind = "provider_unavailable"
+	ProviderErrorTransport        ProviderErrorKind = "transport_error"
+	ProviderErrorModelUnavailable ProviderErrorKind = "model_unavailable"
 )
 
 type ProviderError struct {

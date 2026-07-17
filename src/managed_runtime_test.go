@@ -128,3 +128,33 @@ func TestCompiledProviderDescriptorsIncludeDisabledProviders(t *testing.T) {
 		t.Fatalf("enabled provider count = %d", enabled)
 	}
 }
+
+func TestManagedAnthropicHandlerUsesSnapshotProvider(t *testing.T) {
+	// Given
+	config := defaultConfig()
+	provider := &mockProvider{
+		id:     ProviderCodex,
+		name:   "Codex",
+		caps:   []Capability{CapabilityResponses},
+		health: ProviderHealth{Authenticated: true},
+		models: &ModelList{Object: "list", Data: []Model{{ID: "gpt-5.4", Object: "model"}}},
+		proxyFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request, _ []byte, _ Capability) error {
+			_, _ = w.Write([]byte(`{"id":"resp_1","output":[]}`))
+			return nil
+		},
+	}
+	manager, err := runtimepkg.NewManager(config, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"codex/gpt-5.4","messages":[{"role":"user","content":"x"}],"max_tokens":8}`))
+	response := httptest.NewRecorder()
+
+	// When
+	managedAnthropicHandler(manager).ServeHTTP(response, request)
+
+	// Then
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}

@@ -1,0 +1,378 @@
++	state := currentConfigState()
++	if state == nil {
++		return controlpkg.MutationResult{}, fmt.Errorf("managed configuration state is unavailable")
++	}
++	before := state.Snapshot()
++	if before.Revision != expected {
++		return controlpkg.MutationResult{}, &statepkg.ConflictError{Expected: expected, Current: before.Revision}
++	}
++	candidate := configschema.Clone(desired)
++	if err := validateManagementCandidate(candidate); err != nil {
++		return controlpkg.MutationResult{}, err
++	}
++	effectiveRefs := hotEffectiveConfig(before.Effective, candidate)
++	preview, err := state.Validate(candidate, effectiveRefs)
++	if err != nil {
++		return controlpkg.MutationResult{}, err
++	}
++	materialized, err := materializeManagedSecrets(ctx, effectiveRefs, controller.secretStore())
++	if err != nil {
++		return controlpkg.MutationResult{}, err
++	}
++	drain, err := controller.providers.Reconcile(ctx, desiredProviders(materialized))
++	if err != nil {
++		return controlpkg.MutationResult{}, fmt.Errorf("provider reconciliation rejected: %w", err)
++	}
++	applied, err := state.Apply(expected, candidate, effectiveRefs, actor, false)
++	if err != nil {
++		previous, previousErr := materializeManagedSecrets(context.Background(), before.Effective, controller.secretStore())
++		if previousErr == nil {
++			_, _ = controller.providers.Reconcile(context.Background(), desiredProviders(previous))
++		}
++		return controlpkg.MutationResult{}, err
++	}
++	return mutationResult(applied, preview, drain), nil
++}
++
++func (controller *managedMutationController) secretStore() interface {
++	Put(context.Context, string, []byte) (*SecretReference, error)
++	Get(context.Context, *SecretReference) ([]byte, error)
++	Delete(context.Context, *SecretReference) error
++	Rotate(context.Context, []byte) error
++} {
++	if controller == nil || controller.secrets == nil {
++		return nil
++	}
++	return controller.secrets.store
++}
++
++func mutationResult(snapshot statepkg.Snapshot, preview statepkg.Preview, drain providerpkg.DrainReport) controlpkg.MutationResult {
++	return controlpkg.MutationResult{
++		Revision:        snapshot.Revision,
++		Digest:          snapshot.Digest,
++		EffectiveDigest: snapshot.EffectiveDigest,
++		ChangedPaths:    append([]string(nil), preview.ChangedPaths...),
++		RestartRequired: append([]string(nil), snapshot.RestartRequired...),
++		DrainCompleted:  drain.Completed,
++		DrainTimedOut:   drain.TimedOut,
++	}
++}
++
++func hotEffectiveConfig(current, desired *Config) *Config {
++	effective := configschema.Clone(desired)
++	if current == nil {
++		return effective
++	}
++	// Listener/process-level settings require a daemon restart. Everything else
++	// is safely published through a new immutable runtime snapshot.
++	effective.Port = current.Port
++	effective.EnablePprof = current.EnablePprof
++	effective.Timeouts.ServerRead = current.Timeouts.ServerRead
++	effective.Timeouts.ServerWrite = current.Timeouts.ServerWrite
++	effective.Timeouts.ServerIdle = current.Timeouts.ServerIdle
++	return effective
++}
++
++func validateManagementCandidate(config *Config) error {
++	if err := validateManagedConfig(config); err != nil {
++		return err
++	}
++	if err := rejectRawSecrets(config); err != nil {
++		return err
++	}
++	validProvider := func(value string) bool {
++		switch providerpkg.ID(value) {
++		case providerpkg.Copilot, providerpkg.Codex, providerpkg.Kilo:
++			return true
++		default:
++			return false
++		}
++	}
++	if !validProvider(config.Routing.DefaultProvider) {
++		return fmt.Errorf("routing.default_provider %q is invalid", config.Routing.DefaultProvider)
++	}
++	for model, entry := range config.Routing.ModelMap {
++		if strings.TrimSpace(model) == "" || !validProvider(entry.Provider) {
++			return fmt.Errorf("routing.model_map contains an invalid entry")
++		}
++		if _, prefixedProvider, ok := splitProviderPrefix(model); ok && string(prefixedProvider) != entry.Provider {
++			return fmt.Errorf("provider-prefixed model %q cannot map to provider %q", model, entry.Provider)
++		}
++	}
++	if config.Providers.Kilo.AllowAnonymous && !kiloHasCredential(config) {
++		for _, model := range config.Providers.Kilo.AllowedModels {
++			bare := strings.TrimPrefix(strings.TrimSpace(model), "kilo/")
++			if bare != "" && bare != kiloAutoFreeModel {
++				return fmt.Errorf("anonymous Kilo may allow only %q", kiloAutoFreeModel)
++			}
++		}
++	}
++	if err := validateAccountLabels(config); err != nil {
++		return err
++	}
++	return nil
++}
++
++func rejectRawSecrets(config *Config) error {
++	if config.Providers.Copilot.Auth.GitHubToken != "" || config.Providers.Copilot.Auth.CopilotToken != "" ||
++		config.Providers.Codex.Auth.APIKey != "" || config.Providers.Codex.Auth.AccessToken != "" || config.Providers.Codex.Auth.RefreshToken != "" || config.Providers.Codex.Auth.AccountID != "" ||
++		config.Providers.Kilo.APIKey != "" || config.Providers.Kilo.OrganizationID != "" {
++		return fmt.Errorf("raw credentials are write-only and cannot be supplied through config mutation")
++	}
++	for _, account := range config.Providers.Copilot.Accounts {
++		if account.Auth.GitHubToken != "" || account.Auth.CopilotToken != "" {
++			return fmt.Errorf("raw Copilot credentials are write-only")
++		}
++	}
++	for _, account := range config.Providers.Codex.Accounts {
++		if account.Auth.APIKey != "" || account.Auth.AccessToken != "" || account.Auth.RefreshToken != "" || account.Auth.AccountID != "" {
++			return fmt.Errorf("raw Codex credentials and upstream account identifiers are write-only")
++		}
++	}
++	return nil
++}
++
++func kiloHasCredential(config *Config) bool {
++	return config.Providers.Kilo.APIKeyRef != nil || strings.TrimSpace(os.Getenv(kiloAPIKeyEnv)) != ""
++}
++
++func splitProviderPrefix(model string) (string, providerpkg.ID, bool) {
++	for prefix, provider := range map[string]providerpkg.ID{"github/": providerpkg.Copilot, "codex/": providerpkg.Codex, "kilo/": providerpkg.Kilo} {
++		if strings.HasPrefix(model, prefix) {
++			return strings.TrimPrefix(model, prefix), provider, true
++		}
++	}
++	return model, "", false
++}
++
++func validateAccountLabels(config *Config) error {
++	seen := map[string]struct{}{}
++	for _, account := range config.Providers.Copilot.Accounts {
++		label := strings.TrimSpace(account.Label)
++		if label == "" {
++			return fmt.Errorf("Copilot account label is required")
++		}
++		key := "copilot\x00" + label
++		if _, exists := seen[key]; exists {
++			return fmt.Errorf("duplicate Copilot account label %q", label)
++		}
++		seen[key] = struct{}{}
++	}
++	for _, account := range config.Providers.Codex.Accounts {
++		label := strings.TrimSpace(account.Label)
++		if label == "" {
++			return fmt.Errorf("Codex account label is required")
++		}
++		key := "codex\x00" + label
++		if _, exists := seen[key]; exists {
++			return fmt.Errorf("duplicate Codex account label %q", label)
++		}
++		seen[key] = struct{}{}
++	}
++	return nil
++}
++
++func cleanModelList(models []string) []string {
++	seen := make(map[string]struct{}, len(models))
++	result := make([]string, 0, len(models))
++	for _, model := range models {
++		model = strings.TrimSpace(model)
++		if model == "" {
++			continue
++		}
++		if _, exists := seen[model]; exists {
++			continue
++		}
++		seen[model] = struct{}{}
++		result = append(result, model)
++	}
++	sort.Strings(result)
++	return result
++}
++
++func findCopilotAccount(accounts []CopilotAccount, value string) int {
++	for index, account := range accounts {
++		if account.ID == value || account.Label == value {
++			return index
++		}
++	}
++	return -1
++}
++func findCodexAccount(accounts []CodexAccount, value string) int {
++	for index, account := range accounts {
++		if account.ID == value || account.Label == value {
++			return index
++		}
++	}
++	return -1
++}
++func moveCopilotAccount(accounts []CopilotAccount, from, to int) []CopilotAccount {
++	if to < 0 {
++		to = 0
++	}
++	if to >= len(accounts) {
++		to = len(accounts) - 1
++	}
++	item := accounts[from]
++	accounts = append(accounts[:from], accounts[from+1:]...)
++	accounts = append(accounts, CopilotAccount{})
++	copy(accounts[to+1:], accounts[to:])
++	accounts[to] = item
++	return accounts
++}
++func moveCodexAccount(accounts []CodexAccount, from, to int) []CodexAccount {
++	if to < 0 {
++		to = 0
++	}
++	if to >= len(accounts) {
++		to = len(accounts) - 1
++	}
++	item := accounts[from]
++	accounts = append(accounts[:from], accounts[from+1:]...)
++	accounts = append(accounts, CodexAccount{})
++	copy(accounts[to+1:], accounts[to:])
++	accounts[to] = item
++	return accounts
++}
++
++func cloneMutationModelMap(source map[string]ModelMapEntry) map[string]ModelMapEntry {
++	if source == nil {
++		return nil
++	}
++	cloned := make(map[string]ModelMapEntry, len(source))
++	for key, value := range source {
++		cloned[key] = value
++	}
++	return cloned
++}
+diff --git a/src/mutation_controller_test.go b/src/mutation_controller_test.go
+new file mode 100644
+index 0000000..d1ab3d5
+--- /dev/null
++++ b/src/mutation_controller_test.go
+@@ -0,0 +1,122 @@
++package yarouter
++
++import (
++	"context"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	configschema "github.com/duvu/ya-router/internal/config"
++	runtimepkg "github.com/duvu/ya-router/internal/runtime"
++	statepkg "github.com/duvu/ya-router/internal/state"
++)
++
++func setupMutationController(t *testing.T) (*managedMutationController, func()) {
++	t.Helper()
++	oldOverride := configPathOverride
++	directory := t.TempDir()
++	configPathOverride = filepath.Join(directory, "config.json")
++	release, err := acquireManagedConfigState("mutation-test")
++	if err != nil {
++		t.Fatal(err)
++	}
++	config := currentConfigState().Snapshot().Effective
++	managedSecrets, err := openManagedSecretStore(configPathOverride)
++	if err != nil {
++		t.Fatal(err)
++	}
++	effective, err := materializeManagedSecrets(context.Background(), config, managedSecrets.store)
++	if err != nil {
++		t.Fatal(err)
++	}
++	runtimeManager, err := runtimepkg.NewManager(effective)
++	if err != nil {
++		t.Fatal(err)
++	}
++	providerManager, err := newProviderManager(effective, runtimeManager)
++	if err != nil {
++		t.Fatal(err)
++	}
++	cleanup := func() {
++		_, _ = providerManager.Reconcile(context.Background(), nil)
++		_ = runtimeManager.Close(context.Background())
++		_ = release()
++		configPathOverride = oldOverride
++	}
++	return newManagedMutationController(providerManager, managedSecrets), cleanup
++}
++
++func TestMutationRevisionConflictDoesNotOverwrite(t *testing.T) {
++	controller, cleanup := setupMutationController(t)
++	defer cleanup()
++	before := currentConfigState().Snapshot()
++	candidate := configschema.Clone(before.Desired)
++	candidate.Routing.DefaultModel = "changed-model"
++	_, err := controller.ApplyConfig(context.Background(), before.Revision+1, candidate, "writer-two")
++	var conflict *statepkg.ConflictError
++	if err == nil || !strings.Contains(err.Error(), "revision conflict") {
++		t.Fatalf("expected revision conflict, got %v (%T)", err, conflict)
++	}
++	after := currentConfigState().Snapshot()
++	if after.Revision != before.Revision || after.Desired.Routing.DefaultModel != before.Desired.Routing.DefaultModel {
++		t.Fatalf("stale writer changed state: before=%+v after=%+v", before, after)
++	}
++}
++
++func TestAnonymousKiloCannotAllowPaidModel(t *testing.T) {
++	controller, cleanup := setupMutationController(t)
++	defer cleanup()
++	before := currentConfigState().Snapshot()
++	candidate := configschema.Clone(before.Desired)
++	candidate.Providers.Kilo.Enabled = true
++	candidate.Providers.Kilo.AllowAnonymous = true
++	candidate.Providers.Kilo.AllowedModels = []string{"paid/model"}
++	_, err := controller.ApplyConfig(context.Background(), before.Revision, candidate, "admin")
++	if err == nil || !strings.Contains(err.Error(), "anonymous Kilo") {
++		t.Fatalf("expected anonymous invariant error, got %v", err)
++	}
++	after := currentConfigState().Snapshot()
++	if after.Revision != before.Revision || after.Desired.Providers.Kilo.Enabled != before.Desired.Providers.Kilo.Enabled {
++		t.Fatal("rejected mutation changed desired state")
++	}
++}
++
++func TestProviderBuildFailureLeavesStateAndRuntimeUnchanged(t *testing.T) {
++	controller, cleanup := setupMutationController(t)
++	defer cleanup()
++	before := currentConfigState().Snapshot()
++	candidate := configschema.Clone(before.Desired)
++	candidate.Providers.Kilo.Enabled = true
++	candidate.Providers.Kilo.BaseURL = "http://example.com/insecure"
++	_, err := controller.ApplyConfig(context.Background(), before.Revision, candidate, "admin")
++	if err == nil || !strings.Contains(err.Error(), "provider reconciliation rejected") {
++		t.Fatalf("expected provider rejection, got %v", err)
++	}
++	after := currentConfigState().Snapshot()
++	if after.Revision != before.Revision || after.Digest != before.Digest || after.EffectiveDigest != before.EffectiveDigest {
++		t.Fatalf("failed apply changed state: before=%+v after=%+v", before, after)
++	}
++}
++
++func TestHotReloadPreservesRestartOnlySettings(t *testing.T) {
++	controller, cleanup := setupMutationController(t)
++	defer cleanup()
++	before := currentConfigState().Snapshot()
++	candidate := configschema.Clone(before.Desired)
++	candidate.Port = before.Desired.Port + 1
++	candidate.Routing.DefaultModel = "new-default"
++	result, err := controller.ApplyConfig(context.Background(), before.Revision, candidate, "admin")
++	if err != nil {
++		t.Fatal(err)
++	}
++	after := currentConfigState().Snapshot()
++	if after.Desired.Port != candidate.Port || after.Effective.Port != before.Effective.Port {
++		t.Fatalf("restart-only port handling is wrong: %+v", after)
++	}
++	if after.Effective.Routing.DefaultModel != "new-default" {
++		t.Fatal("hot-reloadable routing did not become effective")
++	}
++	if result.Revision != after.Revision || len(result.RestartRequired) == 0 {
++		t.Fatalf("restart metadata missing: %+v", result)
++	}
++}
++-- 
++2.47.3
++

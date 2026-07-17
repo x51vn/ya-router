@@ -1,0 +1,373 @@
+ - [ ] [YA-TUI-08 (#14)](https://github.com/duvu/ya-router/issues/14) add revision-safe mutations and hot reload.
+ - [ ] [YA-TUI-09 (#15)](https://github.com/duvu/ya-router/issues/15) add client SDK and scriptable commands.
+ - [ ] [YA-TUI-10 (#16)](https://github.com/duvu/ya-router/issues/16) add read-only TUI.
+diff --git a/src/auth.go b/src/auth.go
+index 6733498..8ce8c8d 100644
+--- a/src/auth.go
++++ b/src/auth.go
+@@ -3,10 +3,10 @@
+ package yarouter
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+-	"io"
+ 	"log"
+ 	"net/http"
+ 	"strings"
+@@ -56,116 +56,146 @@ func copilotAuthenticate(auth *CopilotAuthState, save func() error) error {
+ 		log.Printf("Token still valid: expires in %d seconds", auth.ExpiresAt-now)
+ 		return nil
+ 	}
+-	if auth.CopilotToken != "" {
+-		log.Printf("Token expiring soon (%d s), re-authenticating", auth.ExpiresAt-now)
+-	} else {
+-		log.Printf("No token found, starting authentication flow")
+-	}
+-
+-	// Step 1: request device code.
+-	req, err := http.NewRequest("POST", copilotDeviceCodeURL, nil)
++	dc, err := beginCopilotDeviceFlow(context.Background())
+ 	if err != nil {
+ 		return err
+ 	}
+-	req.Header.Set("Accept", "application/json")
+-	req.Header.Set("Content-Type", "application/json")
+-	req.Header.Set("User-Agent", userAgent)
+-	req.Body = io.NopCloser(strings.NewReader(
+-		fmt.Sprintf(`{"client_id":"%s","scope":"%s"}`, copilotClientID, copilotScope)))
+-
+-	resp, err := sharedHTTPClient.Do(req)
++	fmt.Printf("\nVisit: %s\nEnter code: %s\n", dc.VerificationURI, dc.UserCode)
++	completed, err := completeCopilotDeviceFlow(context.Background(), dc)
+ 	if err != nil {
+ 		return err
+ 	}
+-	defer resp.Body.Close()
+-
+-	var dc deviceCodeResponse
+-	if err := json.NewDecoder(resp.Body).Decode(&dc); err != nil {
++	*auth = completed
++	if err := save(); err != nil {
+ 		return err
+ 	}
+-	fmt.Printf("\nVisit: %s\nEnter code: %s\n", dc.VerificationURI, dc.UserCode)
++	fmt.Println("Authentication successful!")
++	return nil
++}
+ 
+-	// Step 2: poll for GitHub access token.
+-	githubToken, err := pollForGitHubToken(dc.DeviceCode, dc.Interval)
++func beginCopilotDeviceFlow(ctx context.Context) (deviceCodeResponse, error) {
++	request, err := http.NewRequestWithContext(ctx, http.MethodPost, copilotDeviceCodeURL, strings.NewReader(
++		fmt.Sprintf(`{"client_id":"%s","scope":"%s"}`, copilotClientID, copilotScope)))
+ 	if err != nil {
+-		return err
++		return deviceCodeResponse{}, err
+ 	}
+-	auth.GitHubToken = githubToken
+-
+-	// Step 3: exchange GitHub token for Copilot token.
+-	copilotToken, expiresAt, refreshIn, err := getCopilotToken(githubToken)
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("Content-Type", "application/json")
++	request.Header.Set("User-Agent", userAgent)
++	response, err := sharedHTTPClient.Do(request)
+ 	if err != nil {
+-		return err
++		return deviceCodeResponse{}, err
+ 	}
+-	auth.CopilotToken = copilotToken
+-	auth.ExpiresAt = expiresAt
+-	auth.RefreshIn = refreshIn
++	defer response.Body.Close()
++	if response.StatusCode != http.StatusOK {
++		return deviceCodeResponse{}, fmt.Errorf("device code request returned status %d", response.StatusCode)
++	}
++	var result deviceCodeResponse
++	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
++		return deviceCodeResponse{}, err
++	}
++	if result.DeviceCode == "" || result.UserCode == "" || result.VerificationURI == "" {
++		return deviceCodeResponse{}, errors.New("device code response is incomplete")
++	}
++	if result.Interval < 1 {
++		result.Interval = 5
++	}
++	return result, nil
++}
+ 
+-	if err := save(); err != nil {
+-		return err
++func completeCopilotDeviceFlow(ctx context.Context, dc deviceCodeResponse) (CopilotAuthState, error) {
++	deadline := time.Now().Add(15 * time.Minute)
++	if dc.ExpiresIn > 0 {
++		deadline = time.Now().Add(time.Duration(dc.ExpiresIn) * time.Second)
+ 	}
+-	fmt.Println("Authentication successful!")
+-	return nil
++	githubToken, err := pollForGitHubTokenContext(ctx, dc.DeviceCode, dc.Interval, deadline)
++	if err != nil {
++		return CopilotAuthState{}, err
++	}
++	copilotToken, expiresAt, refreshIn, err := getCopilotTokenContext(ctx, githubToken)
++	if err != nil {
++		return CopilotAuthState{}, err
++	}
++	return CopilotAuthState{Mode: "device_code", GitHubToken: githubToken, CopilotToken: copilotToken, ExpiresAt: expiresAt, RefreshIn: refreshIn}, nil
+ }
+ 
+ func pollForGitHubToken(deviceCode string, interval int) (string, error) {
+-	for i := 0; i < 120; i++ {
+-		time.Sleep(time.Duration(interval) * time.Second)
++	return pollForGitHubTokenContext(context.Background(), deviceCode, interval, time.Now().Add(15*time.Minute))
++}
+ 
+-		req, err := http.NewRequest("POST", copilotTokenURL, nil)
++func pollForGitHubTokenContext(ctx context.Context, deviceCode string, interval int, deadline time.Time) (string, error) {
++	if interval < 1 {
++		interval = 5
++	}
++	for time.Now().Before(deadline) {
++		timer := time.NewTimer(time.Duration(interval) * time.Second)
++		select {
++		case <-ctx.Done():
++			timer.Stop()
++			return "", ctx.Err()
++		case <-timer.C:
++		}
++		request, err := http.NewRequestWithContext(ctx, http.MethodPost, copilotTokenURL, strings.NewReader(
++			fmt.Sprintf(`{"client_id":"%s","device_code":"%s","grant_type":"urn:ietf:params:oauth:grant-type:device_code"}`, copilotClientID, deviceCode)))
+ 		if err != nil {
+ 			return "", err
+ 		}
+-		req.Header.Set("Accept", "application/json")
+-		req.Header.Set("Content-Type", "application/json")
+-		req.Header.Set("User-Agent", userAgent)
+-		body := fmt.Sprintf(`{"client_id":"%s","device_code":"%s","grant_type":"urn:ietf:params:oauth:grant-type:device_code"}`,
+-			copilotClientID, deviceCode)
+-		req.Body = io.NopCloser(strings.NewReader(body))
+-
+-		resp, err := sharedHTTPClient.Do(req)
++		request.Header.Set("Accept", "application/json")
++		request.Header.Set("Content-Type", "application/json")
++		request.Header.Set("User-Agent", userAgent)
++		response, err := sharedHTTPClient.Do(request)
+ 		if err != nil {
++			if ctx.Err() != nil {
++				return "", ctx.Err()
++			}
+ 			continue
+ 		}
+-		var tr tokenResponse
+-		json.NewDecoder(resp.Body).Decode(&tr)
+-		resp.Body.Close()
+-
+-		if tr.Error != "" {
+-			if tr.Error == "authorization_pending" {
++		var token tokenResponse
++		decodeErr := json.NewDecoder(response.Body).Decode(&token)
++		response.Body.Close()
++		if decodeErr != nil {
++			continue
++		}
++		if token.Error != "" {
++			if token.Error == "authorization_pending" || token.Error == "slow_down" {
++				if token.Error == "slow_down" {
++					interval += 5
++				}
+ 				continue
+ 			}
+-			return "", fmt.Errorf("authorization error: %s", sanitizeReasonCode(tr.Error))
++			return "", fmt.Errorf("authorization error: %s", sanitizeReasonCode(token.Error))
+ 		}
+-		if tr.AccessToken != "" {
+-			return tr.AccessToken, nil
++		if token.AccessToken != "" {
++			return token.AccessToken, nil
+ 		}
+ 	}
+ 	return "", fmt.Errorf("authentication timed out")
+ }
+ 
+ func getCopilotToken(githubToken string) (string, int64, int64, error) {
+-	req, err := http.NewRequest("GET", copilotAPIKeyURL, nil)
++	return getCopilotTokenContext(context.Background(), githubToken)
++}
++
++func getCopilotTokenContext(ctx context.Context, githubToken string) (string, int64, int64, error) {
++	request, err := http.NewRequestWithContext(ctx, http.MethodGet, copilotAPIKeyURL, nil)
+ 	if err != nil {
+ 		return "", 0, 0, err
+ 	}
+-	req.Header.Set("Authorization", "token "+githubToken)
+-	req.Header.Set("User-Agent", userAgent)
+-
+-	resp, err := sharedHTTPClient.Do(req)
++	request.Header.Set("Authorization", "token "+githubToken)
++	request.Header.Set("User-Agent", userAgent)
++	response, err := sharedHTTPClient.Do(request)
+ 	if err != nil {
+ 		return "", 0, 0, err
+ 	}
+-	defer resp.Body.Close()
+-
+-	if resp.StatusCode != 200 {
+-		return "", 0, 0, fmt.Errorf("failed to get Copilot token: %d", resp.StatusCode)
++	defer response.Body.Close()
++	if response.StatusCode != http.StatusOK {
++		return "", 0, 0, fmt.Errorf("failed to get Copilot token: %d", response.StatusCode)
+ 	}
+-	var ctr copilotTokenResponse
+-	if err := json.NewDecoder(resp.Body).Decode(&ctr); err != nil {
++	var token copilotTokenResponse
++	if err := json.NewDecoder(response.Body).Decode(&token); err != nil {
+ 		return "", 0, 0, err
+ 	}
+-	return ctr.Token, ctr.ExpiresAt, ctr.RefreshIn, nil
++	return token.Token, token.ExpiresAt, token.RefreshIn, nil
+ }
+ 
+ // copilotRefreshToken exchanges the long-lived GitHub token for a fresh Copilot token.
+diff --git a/src/auth_controller.go b/src/auth_controller.go
+new file mode 100644
+index 0000000..897665d
+--- /dev/null
++++ b/src/auth_controller.go
+@@ -0,0 +1,513 @@
++package yarouter
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"os"
++	"strings"
++	"sync"
++	"time"
++
++	configschema "github.com/duvu/ya-router/internal/config"
++	controlpkg "github.com/duvu/ya-router/internal/control"
++	operationpkg "github.com/duvu/ya-router/internal/operation"
++	providerpkg "github.com/duvu/ya-router/internal/provider"
++	secretpkg "github.com/duvu/ya-router/internal/secret"
++)
++
++var managementMutationMu sync.Mutex
++
++type authChallenge struct {
++	VerificationURI string
++	UserCode        string
++	ExpiresAt       time.Time
++	Complete        func(context.Context) (managedCredential, error)
++}
++
++type managedCredential struct {
++	Copilot   *CopilotAuthState
++	Codex     *CodexAuthState
++	KiloKey   []byte
++	Anonymous bool
++}
++
++type managedAuthAdapter interface {
++	BeginDevice(context.Context) (authChallenge, error)
++	FromSecret(context.Context, string, []byte) (managedCredential, error)
++	Anonymous(context.Context) (managedCredential, error)
++}
++
++type authSessionTransient struct {
++	owner           string
++	provider        string
++	account         string
++	mode            string
++	verificationURI string
++	userCode        string
++	expiresAt       time.Time
++	cancel          context.CancelFunc
++}
++
++type managedAuthController struct {
++	operations     *operationpkg.Manager
++	secrets        secretpkg.Store
++	managedSecrets *managedSecretStore
++	providers      *providerpkg.Manager
++	adapters       map[string]managedAuthAdapter
++
++	mu       sync.RWMutex
++	sessions map[string]authSessionTransient
++}
++
++func newManagedAuthController(operations *operationpkg.Manager, managedSecrets *managedSecretStore, providers *providerpkg.Manager) *managedAuthController {
++	return &managedAuthController{
++		operations:     operations,
++		secrets:        managedSecrets.store,
++		managedSecrets: managedSecrets,
++		providers:      providers,
++		adapters: map[string]managedAuthAdapter{
++			string(ProviderCopilot): copilotManagedAuthAdapter{},
++			string(ProviderCodex):   codexManagedAuthAdapter{},
++			string(ProviderKilo):    kiloManagedAuthAdapter{},
++		},
++		sessions: make(map[string]authSessionTransient),
++	}
++}
++
++func (controller *managedAuthController) StartAuthSession(_ context.Context, request controlpkg.AuthSessionStart) (controlpkg.AuthSessionView, bool, error) {
++	if controller == nil || controller.operations == nil {
++		return controlpkg.AuthSessionView{}, false, fmt.Errorf("authentication controller is unavailable")
++	}
++	adapter, exists := controller.adapters[request.Provider]
++	if !exists {
++		return controlpkg.AuthSessionView{}, false, fmt.Errorf("unsupported authentication provider")
++	}
++	if err := enforceCredentialPrecedence(request.Provider, request.Mode); err != nil {
++		return controlpkg.AuthSessionView{}, false, err
++	}
++	if (request.Mode == "api_key" || request.Mode == "recovery_token") && len(request.Secret) == 0 {
++		return controlpkg.AuthSessionView{}, false, fmt.Errorf("credential input is required")
++	}
++	target := request.Provider
++	if request.Account != "" {
++		target += "/" + request.Account
++	}
++	expiresAt := request.ExpiresAt
++	if !expiresAt.After(controller.operations.Now()) {
++		expiresAt = controller.operations.Now().Add(controller.operations.DefaultTTL())
++	}
++	operation, created, err := controller.operations.Create(operationpkg.CreateRequest{
++		Kind: "auth_" + request.Mode, Target: target, Owner: request.Owner, Cancelable: true,
++		IdempotencyKey: request.IdempotencyKey, RequestDigest: request.RequestDigest, ExpiresAt: expiresAt, RecoveryPolicy: operationpkg.RecoveryExpire,
++	})
++	if err != nil {
++		return controlpkg.AuthSessionView{}, false, err
++	}
++	if !created {
++		view, viewErr := controller.AuthSession(context.Background(), operation.ID, request.Owner, false)
++		return view, false, viewErr
++	}
++
++	switch request.Mode {
++	case "device_code":
++		beginContext, cancelBegin := context.WithTimeout(context.Background(), 30*time.Second)
++		challenge, beginErr := adapter.BeginDevice(beginContext)
++		cancelBegin()
++		if beginErr != nil {
++			failed, _ := controller.operations.Transition(operation.ID, operationpkg.StateFailed, 0, nil, failureFor("authentication_failed", true), "failed")
++			return controller.viewFor(failed), true, nil
++		}
++		workerContext, cancel := context.WithDeadline(context.Background(), challenge.ExpiresAt)
++		controller.mu.Lock()
++		controller.sessions[operation.ID] = authSessionTransient{owner: request.Owner, provider: request.Provider, account: request.Account, mode: request.Mode, verificationURI: challenge.VerificationURI, userCode: challenge.UserCode, expiresAt: challenge.ExpiresAt, cancel: cancel}
++		controller.mu.Unlock()
++		waiting, _ := controller.operations.Transition(operation.ID, operationpkg.StateWaitingForUser, 10, map[string]string{"verification_uri": challenge.VerificationURI}, nil, "waiting_for_user")
++		go controller.completeDevice(workerContext, operation.ID, request.Provider, request.Account, adapter, challenge)
++		view := controller.viewFor(waiting)
++		view.VerificationURI = challenge.VerificationURI
++		view.UserCode = challenge.UserCode
++		return view, true, nil
++	case "api_key", "recovery_token":
++		secretCopy := append([]byte(nil), request.Secret...)
++		workerContext, cancel := context.WithCancel(context.Background())
++		controller.mu.Lock()

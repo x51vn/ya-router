@@ -17,7 +17,7 @@ It routes to GitHub Copilot, ChatGPT-backed Codex, OpenAI Platform API-key mode,
 ## Layout
 
 - Provider implementations and the compatibility service live in the importable `src` package.
-- Executable roots are `cmd/ya-router` (compatibility), `cmd/ya-routerd` (service), and `cmd/ya` (client foundation).
+- Executable roots are `cmd/ya-router` (compatibility), `cmd/ya-routerd` (service), and `cmd/ya` (dashboard and scriptable client).
 - Shared contracts live under `internal/api`, `internal/config`, `internal/provider`, `internal/proxy`, `internal/routing`, and `internal/runtime`.
 - `internal/runtime.Manager` atomically publishes immutable snapshots. Every data-plane handler must acquire one lease at request start and release it only after the response finishes.
 - `internal/provider.Manager` owns factory/descriptor registration, provider/account reconciliation, replacement/removal, bounded drain, lifecycle events, and the independent health registry. Never mutate a provider already present in a published snapshot.
@@ -50,11 +50,12 @@ CI runs formatting verification, `go vet ./...`, `go test -race -count=1 ./...`,
 
 1. `routing.model_map` is evaluated first.
 2. `github/`, `codex/`, and `kilo/` prefixes are authoritative.
-3. Provider catalogs are checked next.
-4. The configured default provider is used only when the request omitted a model.
-5. Explicit unknown models fail and do not implicitly rotate to or select a Copilot model.
-6. A prefixed request never falls through to another provider.
-7. Cross-provider billing fallback is forbidden unless an explicit future specification allows it.
+3. Exact configured `routing.virtual_models` IDs, including default `thiendu`, select one configured target before dispatch.
+4. Provider catalogs are checked next.
+5. The configured default provider is used only when the request omitted a model.
+6. Explicit unknown models fail and do not implicitly rotate to or select a Copilot model.
+7. A prefixed request never falls through to another provider.
+8. Cross-provider billing fallback is forbidden unless an explicit future specification allows it.
 
 Do not reintroduce a pre-router Copilot fast path.
 

@@ -12,6 +12,12 @@ const (
 	KiloModelPrefix    = "kilo/"
 )
 
+// KnownPrefixes returns every provider model-ID prefix in deterministic order.
+// Umbrella-model validation uses it to classify target IDs.
+func KnownPrefixes() []string {
+	return []string{CopilotModelPrefix, CodexModelPrefix, KiloModelPrefix}
+}
+
 // ProviderPrefix returns the model ID prefix for the given provider.
 func ProviderPrefix(providerID provider.ID) string {
 	switch providerID {

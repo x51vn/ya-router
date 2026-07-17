@@ -395,7 +395,10 @@ Management actions must not stop the shared proxy worker pool or interrupt unrel
 
 The same client library powers TUI commands and non-interactive commands. Scriptable commands support stable exit codes, `--json`, connection profile selection, timeouts, and stdin secret import.
 
-Bubble Tea v2 with Bubbles and Lip Gloss is the preferred initial Go stack. Dependencies are pinned and validated in terminal integration tests before acceptance.
+The Go 1.22 MVP uses pinned Bubble Tea v1 for the keyboard-driven dashboard.
+The dashboard avoids third-party input widgets, keeps API-key input masked and
+bounded in memory, and validates the client reducer and Unix-socket control
+path in tests.
 
 ## 14. Deployment architecture
 
@@ -497,4 +500,3 @@ The feature is not production-ready until all of the following pass:
 - Bubble Tea, Bubbles, and Lip Gloss: <https://github.com/charmbracelet/bubbletea>, <https://github.com/charmbracelet/bubbles>, <https://github.com/charmbracelet/lipgloss>
 - Docker build guidance: <https://docs.docker.com/build/building/best-practices/>
 - Kilo provider implementation: <https://github.com/duvu/ya-router/pull/5>
-

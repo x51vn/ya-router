@@ -1,0 +1,1072 @@
+openapi: 3.1.0
+info:
+  title: ya-router Control API
+  version: 1.0.0
+  description: 'Isolated management-plane contract for ya-routerd. The Control API
+    does
+
+    not accept YA_ROUTER_API_KEY and is not served from the OpenAI-compatible
+
+    data-plane listener.
+
+    '
+servers:
+- url: http://unix/control/v1
+  description: Local Unix socket transport (socket path is deployment-specific)
+- url: https://127.0.0.1:7443/control/v1
+  description: Optional loopback TLS transport
+paths:
+  /meta:
+    get:
+      operationId: getControlMeta
+      summary: Negotiate Control API and client compatibility
+      description: 'Returns service version, supported Control API versions, feature
+        flags,
+
+        N/N-1 client compatibility, deployment mode, current configuration
+
+        revision, and restart-required state. Unsupported clients may call this
+
+        discovery endpoint and receive compatible=false; other resources reject
+
+        unsupported clients before executing an operation.
+
+        '
+      security:
+      - localUnixSocket: []
+      - controlBearer: []
+      - mutualTLS: []
+      parameters:
+      - $ref: '#/components/parameters/RequestID'
+      - $ref: '#/components/parameters/ClientVersion'
+      responses:
+        '200':
+          description: Control metadata and compatibility result
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetaResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /providers:
+    get:
+      operationId: listControlProviders
+      summary: List all compiled-in providers
+      security: &id001
+      - localUnixSocket: []
+      - controlBearer: []
+      - mutualTLS: []
+      parameters:
+      - $ref: '#/components/parameters/RequestID'
+      - $ref: '#/components/parameters/ClientVersion'
+      responses:
+        '200':
+          description: Successful redacted read
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderCollection'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /accounts:
+    get:
+      operationId: listControlAccounts
+      summary: List redacted daemon-owned accounts
+      security: *id001
+      parameters:
+      - $ref: '#/components/parameters/RequestID'
+      - $ref: '#/components/parameters/ClientVersion'
+      responses:
+        '200':
+          description: Successful redacted read
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountCollection'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /models:
+    get:
+      operationId: listControlModels
+      summary: List model catalog freshness and availability
+      security: *id001
+      parameters:
+      - $ref: '#/components/parameters/RequestID'
+      - $ref: '#/components/parameters/ClientVersion'
+      - name: refresh
+        in: query
+        required: false
+        schema:
+          type: boolean
+      responses:
+        '200':
+          description: Successful redacted read
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelCatalogResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /config:
+    get:
+      operationId: getControlConfig
+      summary: Read redacted desired and effective configuration
+      security: *id001
+      parameters:
+      - $ref: '#/components/parameters/RequestID'
+      - $ref: '#/components/parameters/ClientVersion'
+      responses:
+        '200':
+          description: Successful redacted read
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfigResource'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /operations:
+    get:
+      operationId: listControlOperations
+      summary: List asynchronous operations
+      security: *id001
+      parameters:
+      - $ref: '#/components/parameters/RequestID'
+      - $ref: '#/components/parameters/ClientVersion'
+      responses:
+        '200':
+          description: Successful redacted read
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationCollection'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      operationId: createControlOperation
+      summary: Create a persistent provider-neutral operation
+      security: &id002
+      - localUnixSocket: []
+      - controlBearer: []
+      - mutualTLS: []
+      parameters:
+      - &id003
+        $ref: '#/components/parameters/RequestID'
+      - &id004
+        $ref: '#/components/parameters/ClientVersion'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOperationRequest'
+      responses:
+        '200':
+          description: Existing idempotent operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Operation'
+        '202':
+          description: Operation accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Operation'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '400': &id005
+          $ref: '#/components/responses/BadRequest'
+        '401': &id006
+          $ref: '#/components/responses/Unauthorized'
+        '403': &id007
+          $ref: '#/components/responses/Forbidden'
+        '426': &id008
+          $ref: '#/components/responses/UpgradeRequired'
+        '500': &id009
+          $ref: '#/components/responses/InternalError'
+  /events:
+    get:
+      operationId: listControlEvents
+      summary: Poll lifecycle events after a sequence
+      security: *id001
+      parameters:
+      - $ref: '#/components/parameters/RequestID'
+      - $ref: '#/components/parameters/ClientVersion'
+      - name: after
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: uint64
+          minimum: 0
+      responses:
+        '200':
+          description: Successful redacted read
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /events/stream:
+    get:
+      operationId: streamControlEvents
+      summary: Resume lifecycle events over Server-Sent Events
+      security: *id001
+      parameters:
+      - $ref: '#/components/parameters/RequestID'
+      - $ref: '#/components/parameters/ClientVersion'
+      - name: Last-Event-ID
+        in: header
+        required: false
+        schema:
+          type: string
+          pattern: ^[0-9]+$
+      responses:
+        '200':
+          description: Resumable event stream
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+  /operations/{operation}:
+    parameters:
+    - $ref: '#/components/parameters/OperationID'
+    get:
+      operationId: getControlOperation
+      summary: Read one visible operation
+      security: *id002
+      parameters: &id010
+      - *id003
+      - *id004
+      responses:
+        '200':
+          description: Operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Operation'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '400': *id005
+        '401': *id006
+        '403': *id007
+        '426': *id008
+        '500': *id009
+    delete:
+      operationId: cancelControlOperation
+      summary: Cancel an owned cancelable operation
+      security: *id002
+      parameters: *id010
+      responses:
+        '200':
+          description: Cancelled operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Operation'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '400': *id005
+        '401': *id006
+        '403': *id007
+        '426': *id008
+        '500': *id009
+  /operations/events:
+    get:
+      operationId: listOperationEvents
+      summary: Poll visible operation events
+      security: *id002
+      parameters:
+      - *id003
+      - *id004
+      - name: after
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: uint64
+          minimum: 0
+      responses:
+        '200':
+          description: Operation event page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationEventPage'
+        '400': *id005
+        '401': *id006
+        '403': *id007
+        '426': *id008
+        '500': *id009
+  /operations/events/stream:
+    get:
+      operationId: streamOperationEvents
+      summary: Resume visible operation events over SSE
+      security: *id002
+      parameters:
+      - *id003
+      - *id004
+      - name: Last-Event-ID
+        in: header
+        required: false
+        schema:
+          type: string
+          pattern: ^[0-9]+$
+      responses:
+        '200':
+          description: Resumable operation event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '400': *id005
+        '401': *id006
+        '403': *id007
+        '426': *id008
+        '500': *id009
+  /auth-sessions:
+    post:
+      operationId: createAuthSession
+      summary: Create a provider-neutral persistent authentication session
+      description: Starts a durable provider-specific authentication workflow.
+        API-key values are supplied only through the write-only secret resource;
+        raw secrets are rejected by this endpoint.
+      security: *id002
+      parameters:
+      - *id003
+      - *id004
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAuthSessionRequest'
+      responses:
+        '200':
+          description: Existing idempotent auth session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Operation'
+        '202':
+          description: Auth session accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Operation'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '400': *id005
+        '401': *id006
+        '403': *id007
+        '426': *id008
+        '500': *id009
+  /auth-sessions/{operation}:
+    parameters:
+    - $ref: '#/components/parameters/OperationID'
+    get:
+      operationId: getAuthSession
+      summary: Read one authentication session
+      security: *id002
+      parameters: *id010
+      responses:
+        '200':
+          description: Auth session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Operation'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '400': *id005
+        '401': *id006
+        '403': *id007
+        '426': *id008
+        '500': *id009
+    delete:
+      operationId: cancelAuthSession
+      summary: Cancel an authentication session
+      security: *id002
+      parameters: *id010
+      responses:
+        '200':
+          description: Cancelled auth session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Operation'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '400': *id005
+        '401': *id006
+        '403': *id007
+        '426': *id008
+        '500': *id009
+components:
+  securitySchemes:
+    localUnixSocket:
+      type: apiKey
+      in: header
+      name: X-Local-Unix-Socket-Identity
+      description: 'Documentation marker only. Local identity is established by Unix
+        socket
+
+        ownership and mode; clients do not send this header.
+
+        '
+    controlBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque-control-token
+      description: 'Independent viewer/operator/admin control token. It must differ
+        from
+
+        YA_ROUTER_API_KEY and is allowed only for explicitly configured loopback
+
+        TLS administration.
+
+        '
+    mutualTLS:
+      type: mutualTLS
+      description: 'Required for non-loopback remote administration. Verified URI
+        SAN,
+
+        full subject, or Common Name values map to viewer/operator/admin roles.
+
+        '
+  parameters:
+    RequestID:
+      name: X-Request-ID
+      in: header
+      required: false
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+      description: Optional safe caller correlation ID. The service generates one
+        otherwise.
+    ClientVersion:
+      name: X-YA-Client-Version
+      in: header
+      required: false
+      schema:
+        type: string
+        examples:
+        - 1.1.0
+        - 1.0.0
+      description: ya client semantic version used for N/N-1 negotiation.
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 200
+      description: Persistent owner-scoped operation creation key.
+    OperationID:
+      name: operation
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: ^op_[a-f0-9]{32}$
+  headers:
+    RequestID:
+      schema:
+        type: string
+      description: Correlation ID included in logs, audit, and typed errors.
+  schemas:
+    MetaResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - service_version
+      - control_api_versions
+      - features
+      - client_compatibility
+      - deployment_mode
+      - config_revision
+      - restart_required
+      properties:
+        service_version:
+          type: string
+        control_api_versions:
+          type: array
+          items:
+            type: string
+          examples:
+          - - v1
+        features:
+          type: array
+          items:
+            type: string
+        client_compatibility:
+          $ref: '#/components/schemas/ClientCompatibility'
+        deployment_mode:
+          type: string
+          enum:
+          - local
+          - remote
+          - local+remote
+        config_revision:
+          type: integer
+          format: uint64
+          minimum: 0
+        restart_required:
+          type: boolean
+    ClientCompatibility:
+      type: object
+      additionalProperties: false
+      required:
+      - minimum
+      - maximum
+      - current
+      - compatible
+      properties:
+        requested:
+          type: string
+        minimum:
+          type: string
+          const: 1.0.0
+        maximum:
+          type: string
+          const: 1.1.x
+        current:
+          type: string
+          const: 1.1.0
+        compatible:
+          type: boolean
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required:
+      - error
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorBody'
+    ErrorBody:
+      type: object
+      additionalProperties: false
+      required:
+      - code
+      - message
+      - retryable
+      - request_id
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        retryable:
+          type: boolean
+        request_id:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+    ProviderCollection:
+      type: object
+      required:
+      - data
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProviderResource'
+    ProviderResource:
+      type: object
+      required:
+      - descriptor
+      - enabled
+      - effective_capabilities
+      - health
+      - generation
+      properties:
+        descriptor:
+          type: object
+          additionalProperties: true
+        enabled:
+          type: boolean
+        effective_capabilities:
+          type: array
+          items:
+            type: string
+        health:
+          type: object
+          additionalProperties: true
+        generation:
+          type: integer
+          format: uint64
+    AccountCollection:
+      type: object
+      required:
+      - data
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/AccountResource'
+    AccountResource:
+      type: object
+      required:
+      - provider_id
+      - id
+      - enabled
+      - priority
+      - credential
+      properties:
+        provider_id:
+          type: string
+        id:
+          type: string
+          description: Daemon-owned opaque account ID
+        label:
+          type: string
+        enabled:
+          type: boolean
+        priority:
+          type: integer
+        credential:
+          $ref: '#/components/schemas/CredentialMetadata'
+    CredentialMetadata:
+      type: object
+      required:
+      - configured
+      - source
+      - refreshable
+      properties:
+        configured:
+          type: boolean
+        source:
+          type: string
+        refreshable:
+          type: boolean
+    ModelCatalogResponse:
+      type: object
+      required:
+      - catalogs
+      properties:
+        catalogs:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProviderCatalog'
+    ProviderCatalog:
+      type: object
+      required:
+      - provider_id
+      - enabled
+      - available
+      - models
+      - stale
+      properties:
+        provider_id:
+          type: string
+        enabled:
+          type: boolean
+        available:
+          type: boolean
+        models:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelResource'
+        fetched_at:
+          type: string
+          format: date-time
+        last_attempt_at:
+          type: string
+          format: date-time
+        age_seconds:
+          type: integer
+          minimum: 0
+        stale:
+          type: boolean
+        last_refresh_error:
+          type: string
+    ModelResource:
+      type: object
+      required:
+      - id
+      - upstream_id
+      - provider_id
+      - available
+      properties:
+        id:
+          type: string
+        upstream_id:
+          type: string
+        provider_id:
+          type: string
+        available:
+          type: boolean
+        owned_by:
+          type: string
+        supported_endpoints:
+          type: array
+          items:
+            type: string
+    ConfigResource:
+      type: object
+      required:
+      - revision
+      - digest
+      - effective_digest
+      - desired
+      - effective
+      properties:
+        revision:
+          type: integer
+          format: uint64
+        digest:
+          type: string
+        effective_digest:
+          type: string
+        restart_required:
+          type: array
+          items:
+            type: string
+        desired:
+          type: object
+          additionalProperties: true
+          description: Redacted desired config
+        effective:
+          type: object
+          additionalProperties: true
+          description: Redacted effective config
+    OperationCollection:
+      type: object
+      required:
+      - data
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Operation'
+    EventPage:
+      type: object
+      required:
+      - data
+      - next_after
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        next_after:
+          type: integer
+          format: uint64
+    OperationFailure:
+      type: object
+      additionalProperties: false
+      required:
+      - code
+      - message
+      - retryable
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        retryable:
+          type: boolean
+    Operation:
+      type: object
+      additionalProperties: false
+      required:
+      - id
+      - kind
+      - owner
+      - state
+      - progress
+      - cancelable
+      - recovery_policy
+      - created_at
+      - updated_at
+      - expires_at
+      - sequence
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+        target:
+          type: string
+        owner:
+          type: string
+        state:
+          type: string
+          enum:
+          - pending
+          - running
+          - waiting_for_user
+          - succeeded
+          - failed
+          - cancelled
+          - expired
+        progress:
+          type: integer
+          minimum: 0
+          maximum: 100
+        cancelable:
+          type: boolean
+        recovery_policy:
+          type: string
+          enum:
+          - fail
+          - expire
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        sequence:
+          type: integer
+          format: uint64
+        failure:
+          $ref: '#/components/schemas/OperationFailure'
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+        result:
+          type: object
+          additionalProperties:
+            type: string
+    CreateOperationRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - kind
+      properties:
+        kind:
+          type: string
+          enum:
+          - config_apply
+          - config_validate
+          - credential_verify
+          - model_refresh
+        target:
+          type: string
+          maxLength: 256
+        cancelable:
+          type: boolean
+          default: true
+        expires_in_seconds:
+          type: integer
+          minimum: 30
+          maximum: 3600
+        recovery_policy:
+          type: string
+          enum:
+          - fail
+          - expire
+    CreateAuthSessionRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - provider_id
+      - method
+      properties:
+        provider_id:
+          type: string
+          enum:
+          - copilot
+          - codex
+          - kilo
+        account_id:
+          type: string
+        method:
+          type: string
+          enum:
+          - device_code
+          - api_key
+          - manual_token_recovery
+          - anonymous
+        expires_in_seconds:
+          type: integer
+          minimum: 30
+          maximum: 3600
+    OperationEvent:
+      type: object
+      additionalProperties: false
+      required:
+      - sequence
+      - operation_id
+      - type
+      - state
+      - timestamp
+      properties:
+        sequence:
+          type: integer
+          format: uint64
+        operation_id:
+          type: string
+        type:
+          type: string
+        state:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+    OperationEventPage:
+      type: object
+      additionalProperties: false
+      required:
+      - data
+      - next_after
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/OperationEvent'
+        next_after:
+          type: integer
+          format: uint64
+  responses:
+    Unauthorized:
+      description: Missing, invalid, or data-plane-only credential
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Forbidden:
+      description: Authenticated identity lacks the required role
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    InternalError:
+      description: Sanitized internal failure
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    BadRequest:
+      description: Invalid request or cursor
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    UpgradeRequired:
+      description: Client version is outside the supported N/N-1 window
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Conflict:
+      description: State or idempotency conflict
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    NotFound:
+      description: Operation or auth session was not found
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'

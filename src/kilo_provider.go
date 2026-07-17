@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	secretpkg "github.com/duvu/ya-router/internal/secret"
 )
 
 const (
@@ -29,6 +31,7 @@ const (
 // the full catalog allowed by the account and provider configuration.
 type KiloProvider struct {
 	cfg    *Config
+	auth   secretpkg.AuthController
 	cb     *CircuitBreaker
 	cache  *ModelCache
 	client *http.Client
@@ -38,12 +41,17 @@ type KiloProvider struct {
 }
 
 func NewKiloProvider(cfg *Config) *KiloProvider {
+	return NewKiloProviderWithAuth(cfg, nil)
+}
+
+func NewKiloProviderWithAuth(cfg *Config, auth secretpkg.AuthController) *KiloProvider {
 	client := sharedHTTPClient
 	if client == nil {
 		client = &http.Client{Timeout: time.Duration(cfg.Timeouts.HTTPClient) * time.Second}
 	}
 	return &KiloProvider{
-		cfg: cfg,
+		cfg:  cfg,
+		auth: auth,
 		cb: &CircuitBreaker{
 			state:   CircuitClosed,
 			timeout: time.Duration(cfg.Timeouts.CircuitBreaker) * time.Second,
@@ -65,6 +73,11 @@ func (p *KiloProvider) Capabilities() []Capability {
 }
 
 func (p *KiloProvider) apiKey() (string, string) {
+	if p.auth != nil {
+		if credential, ok := p.auth.ResolveCredential("kilo/api_key"); ok {
+			return credential.Value, string(credential.Source)
+		}
+	}
 	if key := strings.TrimSpace(os.Getenv(kiloAPIKeyEnv)); key != "" {
 		return key, kiloAPIKeyEnv
 	}
@@ -75,6 +88,11 @@ func (p *KiloProvider) apiKey() (string, string) {
 }
 
 func (p *KiloProvider) organizationID() string {
+	if p.auth != nil {
+		if credential, ok := p.auth.ResolveCredential("kilo/organization_id"); ok {
+			return credential.Value
+		}
+	}
 	if organizationID := strings.TrimSpace(os.Getenv(kiloOrganizationIDEnv)); organizationID != "" {
 		return organizationID
 	}

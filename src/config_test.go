@@ -41,6 +41,40 @@ func TestDefaultConfig(t *testing.T) {
 	}
 }
 
+func Test_defaultConfig_uses_bounded_file_logging_defaults(t *testing.T) {
+	// Given
+	cfg := defaultConfig()
+
+	// When
+	logging := cfg.Logging
+
+	// Then
+	if logging.FilePath != defaultLogFilePath {
+		t.Fatalf("log file path = %q, want %q", logging.FilePath, defaultLogFilePath)
+	}
+	if logging.MaxFileSizeMiB != defaultLogFileSizeMiB {
+		t.Fatalf("max log file size = %d, want %d", logging.MaxFileSizeMiB, defaultLogFileSizeMiB)
+	}
+	if logging.RetainedFiles != defaultRetainedLogFiles {
+		t.Fatalf("retained log files = %d, want %d", logging.RetainedFiles, defaultRetainedLogFiles)
+	}
+}
+
+func Test_applyConfigDefaults_restores_omitted_logging_settings(t *testing.T) {
+	// Given
+	cfg := &Config{}
+
+	// When
+	applyConfigDefaults(cfg)
+
+	// Then
+	if cfg.Logging.FilePath != defaultLogFilePath ||
+		cfg.Logging.MaxFileSizeMiB != defaultLogFileSizeMiB ||
+		cfg.Logging.RetainedFiles != defaultRetainedLogFiles {
+		t.Fatalf("logging defaults = %+v", cfg.Logging)
+	}
+}
+
 func TestGetConfigPath_UsesConfigPathEnv(t *testing.T) {
 	old := configPathOverride
 	configPathOverride = ""

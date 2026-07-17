@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	configschema "github.com/duvu/ya-router/internal/config"
+	routingpkg "github.com/duvu/ya-router/internal/routing"
 	statepkg "github.com/duvu/ya-router/internal/state"
 )
 
@@ -70,6 +71,9 @@ func validateManagedConfig(config *configschema.Config) error {
 	}
 	if config.Port < 1 || config.Port > 65535 {
 		return fmt.Errorf("port must be between 1 and 65535")
+	}
+	if err := config.Routing.ValidateVirtualModels(routingpkg.KnownPrefixes()); err != nil {
+		return err
 	}
 	return nil
 }

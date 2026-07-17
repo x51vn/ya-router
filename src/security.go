@@ -59,6 +59,10 @@ func secureHandler(next http.Handler) http.Handler {
 			return
 		}
 		if apiKey != "" && !validInboundCredential(r, apiKey) {
+			if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+				writeAnthropicError(w, http.StatusUnauthorized, newProviderError("", ProviderErrorAuthRequired, http.StatusUnauthorized, false, "invalid or missing proxy credential"))
+				return
+			}
 			writeOpenAIError(w, http.StatusUnauthorized, newProviderError("", ProviderErrorAuthRequired, http.StatusUnauthorized, false, "invalid or missing proxy credential"))
 			return
 		}

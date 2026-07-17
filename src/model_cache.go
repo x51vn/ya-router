@@ -83,6 +83,19 @@ func (c *ModelCache) Invalidate() {
 	c.fetched = time.Time{}
 }
 
+// LastKnownGood returns the most recent cached model list without initiating a
+// fetch, together with the time it was stored and whether the entry is older
+// than the cache TTL. ok is false when nothing has ever been cached. This backs
+// umbrella-model availability reads, which must never trigger network I/O.
+func (c *ModelCache) LastKnownGood() (list *ModelList, fetched time.Time, stale bool, ok bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.data == nil {
+		return nil, time.Time{}, false, false
+	}
+	return cloneModelList(c.data), c.fetched, time.Since(c.fetched) >= c.ttl, true
+}
+
 // Age returns how long ago the cache was last populated.
 // Returns -1 if the cache is empty.
 func (c *ModelCache) Age() time.Duration {

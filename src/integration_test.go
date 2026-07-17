@@ -116,6 +116,7 @@ func TestModelsEndpointAggregatesMultipleProviders(t *testing.T) {
 	})
 
 	cfg := defaultConfig()
+	cfg.Routing.VirtualModels = map[string]VirtualModelConfig{}
 	handler := modelsHandler(registry, cfg)
 
 	req := httptest.NewRequest("GET", "/v1/models", nil)
@@ -154,6 +155,7 @@ func TestModelsEndpointEmptyWhenNoAuth(t *testing.T) {
 	})
 
 	cfg := defaultConfig()
+	cfg.Routing.VirtualModels = map[string]VirtualModelConfig{}
 	cfg.Routing.ShowUnavailableModels = false
 
 	handler := modelsHandler(registry, cfg)
@@ -436,6 +438,7 @@ func TestModelsEndpointKeepsModelMapVisibleWhenProviderUnavailable(t *testing.T)
 	})
 
 	cfg := defaultConfig()
+	cfg.Routing.VirtualModels = map[string]VirtualModelConfig{}
 	cfg.Routing.ModelMap = map[string]ModelMapEntry{
 		"gpt-5.4": {Provider: string(ProviderCodex)},
 	}

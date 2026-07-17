@@ -17,6 +17,9 @@ build-client:
 
 build-all: build build-daemon build-client
 
+release-linux:
+	VERSION="$(VERSION)" SOURCE_COMMIT="$${SOURCE_COMMIT:-$$(git rev-parse HEAD)}" ./scripts/package-linux-amd64.sh
+
 run: build
 	./$(BINARY) run
 
@@ -47,6 +50,6 @@ test:
 check: fmt-check vet test build-all
 
 help:
-	@echo "Targets: build build-daemon build-client build-all run auth models config clean fmt fmt-check vet test check"
+	@echo "Targets: build build-daemon build-client build-all release-linux run auth models config clean fmt fmt-check vet test check"
 
-.PHONY: all build build-daemon build-client build-all run auth models config clean fmt fmt-check vet test check help
+.PHONY: all build build-daemon build-client build-all release-linux run auth models config clean fmt fmt-check vet test check help

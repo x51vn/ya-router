@@ -2,6 +2,11 @@
   "port": 7071,
   "config_version": 1,
   "enable_pprof": false,
+  "logging": {
+    "file_path": "logs/ya-router.log",
+    "max_file_size_mib": 5,
+    "retained_files": 2
+  },
   "routing": {
     "default_model": "gpt-5-mini",
     "default_provider": "copilot",
@@ -21,6 +26,26 @@
       "kilo/kilo-auto/free": {
         "provider": "kilo",
         "upstream_model": "kilo-auto/free"
+      }
+    },
+    "claude_aliases": {
+      "claude-ya-codex-gpt-5-4": "codex/gpt-5.4"
+    },
+    "virtual_models": {
+      "thiendu": {
+        "strategy": "priority",
+        "targets": [
+          "github/gpt-5-mini",
+          "codex/gpt-5.4-mini",
+          "kilo/kilo-auto/free"
+        ]
+      },
+      "router/auto": {
+        "strategy": "priority",
+        "targets": [
+          "github/gpt-5-mini",
+          "codex/gpt-5.4-mini"
+        ]
       }
     }
   },

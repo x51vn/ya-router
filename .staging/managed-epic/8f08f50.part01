@@ -1,0 +1,420 @@
++\tif len(lines) == 1 {
++\t\tlines = append(lines, "No provider data.")
++\t}
++\treturn cropTUILines(lines, model.height-6)
++}
++
++func (model tuiModel) renderAccounts(styles tuiStyles) string {
++\tlines := []string{styles.section.Render("Accounts")}
++\tfor _, account := range model.data.accounts {
++\t\tstate := "disabled"
++\t\tif account.Enabled {
++\t\t\tstate = "enabled"
++\t\t}
++\t\tcredential := "not configured"
++\t\tif account.Credential.Configured {
++\t\t\tcredential = "configured via " + emptyFallback(account.Credential.Source, "unknown")
++\t\t}
++\t\tlines = append(lines, fmt.Sprintf("[%s] %s/%s label=%q priority=%d credential=%s", state, account.ProviderID, account.ID, account.Label, account.Priority, credential))
++\t}
++\tif len(lines) == 1 {
++\t\tlines = append(lines, "No account data.")
++\t}
++\treturn cropTUILines(lines, model.height-6)
++}
++
++func (model tuiModel) renderModels(styles tuiStyles) string {
++\tlines := []string{styles.section.Render("Models")}
++\tfor _, catalog := range model.data.models.Catalogs {
++\t\tstatus := "fresh"
++\t\tif catalog.Stale {
++\t\t\tstatus = "stale"
++\t\t}
++\t\tif !catalog.Available {
++\t\t\tstatus = "unavailable"
++\t\t}
++\t\tlines = append(lines, fmt.Sprintf("%s [%s] age=%ds", catalog.ProviderID, status, catalog.AgeSeconds))
++\t\tfor _, model := range catalog.Models {
++\t\t\tavailability := "unavailable"
++\t\t\tif model.Available {
++\t\t\t\tavailability = "available"
++\t\t\t}
++\t\t\tlines = append(lines, fmt.Sprintf("  [%s] %s", availability, model.ID))
++\t\t}
++\t}
++\tif len(lines) == 1 {
++\t\tlines = append(lines, "No model data.")
++\t}
++\treturn cropTUILines(lines, model.height-6)
++}
++
++func (model tuiModel) renderConfig(styles tuiStyles) string {
++\tlines := []string{styles.section.Render("Configuration"),
++\t\tfmt.Sprintf("Revision: %d", model.data.configuration.Revision),
++\t\tfmt.Sprintf("Digest: %s", emptyFallback(model.data.configuration.Digest, "unknown")),
++\t\tfmt.Sprintf("Restart required: %s", joinStrings(model.data.configuration.RestartRequired)),
++\t}
++\tif model.data.configuration.Desired != nil {
++\t\tlines = append(lines,
++\t\t\tfmt.Sprintf("Default provider: %s", model.data.configuration.Desired.Routing.DefaultProvider),
++\t\t\tfmt.Sprintf("Default model: %s", model.data.configuration.Desired.Routing.DefaultModel))
++\t}
++\treturn cropTUILines(lines, model.height-6)
++}
++
++func (model tuiModel) renderOperations(styles tuiStyles) string {
++\tlines := []string{styles.section.Render("Operations")}
++\toperations := append([]controlpkg.OperationResource(nil), model.data.operations...)
++\tsort.SliceStable(operations, func(left, right int) bool { return operations[left].UpdatedAt.After(operations[right].UpdatedAt) })
++\tfor _, operation := range operations {
++\t\tlines = append(lines, fmt.Sprintf("[%s] %s kind=%s progress=%d%% updated=%s", operation.State, operation.ID, operation.Kind, operation.Progress, operation.UpdatedAt.Format(time.RFC3339)))
++\t}
++\tif len(lines) == 1 {
++\t\tlines = append(lines, "No operations.")
++\t}
++\treturn cropTUILines(lines, model.height-6)
++}
++
++func (model tuiModel) renderEvents(styles tuiStyles) string {
++\tlines := []string{styles.section.Render("Lifecycle events")}
++\tfor _, event := range model.data.events.Data {
++\t\tlines = append(lines, fmt.Sprintf("#%d %s provider=%s generation=%d", event.Sequence, event.Type, event.ProviderID, event.Generation))
++\t}
++\tif len(lines) == 1 {
++\t\tlines = append(lines, "No events.")
++\t}
++\treturn cropTUILines(lines, model.height-6)
++}
++
++func (model tuiModel) loadCmd(refreshModels bool) tea.Cmd {
++\treturn func() tea.Msg {
++\t\tif model.client == nil {
++\t\t\treturn tuiErrorMsg{err: errors.New("control client is not configured")}
++\t\t}
++\t\tctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
++\t\tdefer cancel()
++\t\tmeta, err := model.client.Meta(ctx)
++\t\tif err != nil {
++\t\t\treturn tuiErrorMsg{err: err}
++\t\t}
++\t\tproviders, err := model.client.Providers(ctx)
++\t\tif err != nil {
++\t\t\treturn tuiErrorMsg{err: err}
++\t\t}
++\t\taccounts, err := model.client.Accounts(ctx)
++\t\tif err != nil {
++\t\t\treturn tuiErrorMsg{err: err}
++\t\t}
++\t\tmodels, err := model.client.Models(ctx, refreshModels)
++\t\tif err != nil {
++\t\t\treturn tuiErrorMsg{err: err}
++\t\t}
++\t\tconfiguration, err := model.client.Configuration(ctx)
++\t\tif err != nil {
++\t\t\treturn tuiErrorMsg{err: err}
++\t\t}
++\t\toperations, err := model.client.Operations(ctx)
++\t\tif err != nil {
++\t\t\treturn tuiErrorMsg{err: err}
++\t\t}
++\t\tevents, err := model.client.Events(ctx, 0)
++\t\tif err != nil {
++\t\t\treturn tuiErrorMsg{err: err}
++\t\t}
++\t\treturn tuiLoadedMsg{snapshot: tuiSnapshot{meta: meta, providers: providers, accounts: accounts, models: models, configuration: configuration, operations: operations, events: events, loadedAt: time.Now().UTC()}}
++\t}
++}
++
++func tuiTickCmd() tea.Cmd {
++\treturn tea.Tick(10*time.Second, func(now time.Time) tea.Msg { return tuiTickMsg(now) })
++}
++
++type tuiStyles struct{ title, section, active, error lipgloss.Style }
++
++func tuiStylesFor(theme tuiTheme) tuiStyles {
++\tstyles := tuiStyles{title: lipgloss.NewStyle().Bold(true), section: lipgloss.NewStyle().Bold(true), active: lipgloss.NewStyle().Bold(true), error: lipgloss.NewStyle().Bold(true)}
++\tif theme == themeMonochrome {
++\t\treturn styles
++\t}
++\tif theme == themeLight {
++\t\tstyles.title = styles.title.Foreground(lipgloss.Color("18"))
++\t\tstyles.active = styles.active.Foreground(lipgloss.Color("24"))
++\t\tstyles.error = styles.error.Foreground(lipgloss.Color("124"))
++\t\treturn styles
++\t}
++\tstyles.title = styles.title.Foreground(lipgloss.Color("81"))
++\tstyles.active = styles.active.Foreground(lipgloss.Color("86"))
++\tstyles.error = styles.error.Foreground(lipgloss.Color("203"))
++\treturn styles
++}
++
++func executeTUI(client *clientpkg.Client, stdout, stderr io.Writer) int {
++\tprogram := tea.NewProgram(newTUIModel(client), tea.WithOutput(stdout), tea.WithAltScreen())
++\tif _, err := program.Run(); err != nil {
++\t\tfmt.Fprintf(stderr, "ya: TUI failed: %v\n", sanitizeTUIError(err))
++\t\treturn clientExitGeneric
++\t}
++\treturn clientExitSuccess
++}
++
++func sanitizeTUIError(err error) error {
++\tif err == nil {
++\t\treturn nil
++\t}
++\tvar apiError *clientpkg.APIError
++\tif errors.As(err, &apiError) {
++\t\treturn apiError
++\t}
++\ttext := strings.TrimSpace(err.Error())
++\tif text == "" {
++\t\ttext = "control service is unavailable"
++\t}
++\tif len(text) > 240 {
++\t\ttext = text[:240] + "…"
++\t}
++\treturn errors.New(text)
++}
++
++func cropTUILines(lines []string, limit int) string {
++\tif limit < 1 {
++\t\tlimit = 1
++\t}
++\tif len(lines) > limit {
++\t\tlines = append(append([]string(nil), lines[:limit-1]...), fmt.Sprintf("… %d more", len(lines)-limit+1))
++\t}
++\treturn strings.Join(lines, "\n")
++}
++func fitTUILine(value string, width int) string {
++\tif width < 2 || len([]rune(value)) <= width {
++\t\treturn value
++\t}
++\trunes := []rune(value)
++\treturn string(runes[:width-1]) + "…"
++}
++func joinCapabilities(capabilities []providerpkg.Capability) string {
++\tif len(capabilities) == 0 {
++\t\treturn "none"
++\t}
++\tvalues := make([]string, 0, len(capabilities))
++\tfor _, capability := range capabilities {
++\t\tvalues = append(values, string(capability))
++\t}
++\treturn strings.Join(values, ",")
++}
++func emptyFallback(value, fallback string) string {
++\tif strings.TrimSpace(value) == "" {
++\t\treturn fallback
++\t}
++\treturn value
++}
++func joinStrings(values []string) string {
++\tif len(values) == 0 {
++\t\treturn "none"
++\t}
++\treturn strings.Join(values, ",")
++}
++func minInt(left, right int) int {
++\tif left < right {
++\t\treturn left
++\t}
++\treturn right
++}
++func maxInt(left, right int) int {
++\tif left > right {
++\t\treturn left
++\t}
++\treturn right
++}
++diff --git a/src/tui_test.go b/src/tui_test.go
++new file mode 100644
++index 0000000..4fedb27
++--- /dev/null
+++++ b/src/tui_test.go
++@@ -0,0 +1,205 @@
+++package yarouter
+++
+++import (
+++\t"context"
+++\t"os"
+++\t"path/filepath"
+++\t"strings"
+++\t"testing"
+++\t"time"
+++
+++\ttea "github.com/charmbracelet/bubbletea"
+++
+++\tcontrolpkg "github.com/duvu/ya-router/internal/control"
+++\tproviderpkg "github.com/duvu/ya-router/internal/provider"
+++)
+++
+++type fakeTUIClient struct {
+++\tsnapshot tuiSnapshot
+++\terr      error
+++}
+++
+++func (client fakeTUIClient) Meta(context.Context) (controlpkg.MetaResponse, error) {
+++\treturn client.snapshot.meta, client.err
+++}
+++func (client fakeTUIClient) Providers(context.Context) ([]controlpkg.ProviderResource, error) {
+++\treturn client.snapshot.providers, client.err
+++}
+++func (client fakeTUIClient) Accounts(context.Context) ([]controlpkg.AccountResource, error) {
+++\treturn client.snapshot.accounts, client.err
+++}
+++func (client fakeTUIClient) Models(context.Context, bool) (controlpkg.ModelCatalogResponse, error) {
+++\treturn client.snapshot.models, client.err
+++}
+++func (client fakeTUIClient) Configuration(context.Context) (controlpkg.ConfigResource, error) {
+++\treturn client.snapshot.configuration, client.err
+++}
+++func (client fakeTUIClient) Operations(context.Context) ([]controlpkg.OperationResource, error) {
+++\treturn client.snapshot.operations, client.err
+++}
+++func (client fakeTUIClient) Events(context.Context, uint64) (controlpkg.EventPage, error) {
+++\treturn client.snapshot.events, client.err
+++}
+++
+++func TestTUIKeyboardNavigationAndExit(t *testing.T) {
+++\tmodel := newTUIModel(fakeTUIClient{})
+++\tupdated, _ := model.Update(tea.KeyMsg{Runes: []rune{'l'}})
+++\tmodel = updated.(tuiModel)
+++\tif model.tab != 1 {
+++\t\tt.Fatalf("right navigation selected tab %d", model.tab)
+++\t}
+++\tupdated, _ = model.Update(tea.KeyMsg{Runes: []rune{'h'}})
+++\tmodel = updated.(tuiModel)
+++\tif model.tab != 0 {
+++\t\tt.Fatalf("left navigation selected tab %d", model.tab)
+++\t}
+++\tupdated, command := model.Update(tea.KeyMsg{Runes: []rune{'q'}})
+++\tif command == nil || updated.(tuiModel).tab != 0 {
+++\t\tt.Fatal("quit did not return a command")
+++\t}
+++}
+++
+++func TestTUIOfflineStateIsTextualAndSanitized(t *testing.T) {
+++\tmodel := newTUIModel(fakeTUIClient{err: &controlClientTestError{}})
+++\tmessage := model.loadCmd(false)()
+++\tupdated, _ := model.Update(message)
+++\tview := updated.(tuiModel).View()
+++\tif !strings.Contains(view, "OFFLINE") || !strings.Contains(view, "request_id=req_test") {
+++\t\tt.Fatalf("offline state lacks textual diagnostics: %s", view)
+++\t}
+++\tfor _, secret := range []string{"api_key", "access_token", "secret-value"} {
+++\t\tif strings.Contains(view, secret) {
+++\t\t\tt.Fatalf("TUI leaked %q: %s", secret, view)
+++\t\t}
+++\t}
+++}
+++
+++type controlClientTestError struct{}
+++
+++func (*controlClientTestError) Error() string {
+++\treturn "control_unavailable: service unavailable (request_id=req_test)"
+++}
+++
+++func TestTUIRenderGoldenTerminalClasses(t *testing.T) {
+++\tsnapshot := sampleTUISnapshot()
+++\tfor _, terminal := range []struct {
+++\t\tname   string
+++\t\twidth  int
+++\t\theight int
+++\t}{
+++\t\t{name: "compact", width: 40, height: 16},
+++\t\t{name: "standard", width: 80, height: 24},
+++\t\t{name: "wide", width: 120, height: 32},
+++\t} {
+++\t\tt.Run(terminal.name, func(t *testing.T) {
+++\t\t\tmodel := newTUIModel(fakeTUIClient{snapshot: snapshot})
+++\t\t\tmodel.theme = themeMonochrome
+++\t\t\tmodel.loading = false
+++\t\t\tmodel.data = snapshot
+++\t\t\tmodel.width = terminal.width
+++\t\t\tmodel.height = terminal.height
+++\t\t\tgot := model.View()
+++\t\t\tpath := filepath.Join("testdata", "tui", terminal.name+".golden")
+++\t\t\tif os.Getenv("UPDATE_GOLDEN") == "1" {
+++\t\t\t\tif err := os.WriteFile(path, []byte(got), 0o600); err != nil {
+++\t\t\t\t\tt.Fatal(err)
+++\t\t\t\t}
+++\t\t\t}
+++\t\t\twant, err := os.ReadFile(path)
+++\t\t\tif err != nil {
+++\t\t\t\tt.Fatal(err)
+++\t\t\t}
+++\t\t\tif got != string(want) {
+++\t\t\t\tt.Fatalf("render mismatch for %s\n--- got ---\n%s\n--- want ---\n%s", terminal.name, got, want)
+++\t\t\t}
+++\t\t\tif strings.Contains(got, "\x1b[") {
+++\t\t\t\tt.Fatal("monochrome render contains ANSI color escapes")
+++\t\t\t}
+++\t\t})
+++\t}
+++}
+++
+++func TestTUIExitDoesNotIssueCancellation(t *testing.T) {
+++\tclient := &countingTUIClient{snapshot: sampleTUISnapshot()}
+++\tmodel := newTUIModel(client)
+++\t_, command := model.Update(tea.KeyMsg{Runes: []rune{'q'}})
+++\tif command == nil {
+++\t\tt.Fatal("quit command missing")
+++\t}
+++\tif client.calls != 0 {
+++\t\tt.Fatalf("TUI exit made %d control calls", client.calls)
+++\t}
+++}
+++
+++type countingTUIClient struct {
+++\tcalls    int
+++\tsnapshot tuiSnapshot
+++}
+++
+++func (client *countingTUIClient) Meta(context.Context) (controlpkg.MetaResponse, error) {
+++\tclient.calls++
+++\treturn client.snapshot.meta, nil
+++}
+++func (client *countingTUIClient) Providers(context.Context) ([]controlpkg.ProviderResource, error) {
+++\tclient.calls++
+++\treturn client.snapshot.providers, nil
+++}
+++func (client *countingTUIClient) Accounts(context.Context) ([]controlpkg.AccountResource, error) {
+++\tclient.calls++
+++\treturn client.snapshot.accounts, nil
+++}
+++func (client *countingTUIClient) Models(context.Context, bool) (controlpkg.ModelCatalogResponse, error) {
+++\tclient.calls++
+++\treturn client.snapshot.models, nil
+++}
+++func (client *countingTUIClient) Configuration(context.Context) (controlpkg.ConfigResource, error) {
+++\tclient.calls++
+++\treturn client.snapshot.configuration, nil
+++}
+++func (client *countingTUIClient) Operations(context.Context) ([]controlpkg.OperationResource, error) {
+++\tclient.calls++
+++\treturn client.snapshot.operations, nil
+++}
+++func (client *countingTUIClient) Events(context.Context, uint64) (controlpkg.EventPage, error) {
+++\tclient.calls++
+++\treturn client.snapshot.events, nil
+++}
+++
+++func sampleTUISnapshot() tuiSnapshot {
+++\tnow := time.Date(2026, 7, 16, 1, 2, 3, 0, time.UTC)
+++\treturn tuiSnapshot{
+++\t\tmeta: controlpkg.MetaResponse{
+++\t\t\tServiceVersion: "test-build", DeploymentMode: "local", ConfigRevision: 12,
+++\t\t},
+++\t\tproviders: []controlpkg.ProviderResource{
+++\t\t\t{
+++\t\t\t\tDescriptor: providerpkg.Descriptor{ID: providerpkg.Copilot, Name: "GitHub Copilot"},
+++\t\t\t\tEnabled:    true, Generation: 7,
+++\t\t\t\tEffectiveCapabilities: []providerpkg.Capability{providerpkg.CapabilityChat},
+++\t\t\t\tHealth:                providerpkg.HealthRecord{ProviderID: providerpkg.Copilot, State: providerpkg.StateReady},
+++\t\t\t},
+++\t\t\t{
+++\t\t\t\tDescriptor: providerpkg.Descriptor{ID: providerpkg.Codex, Name: "OpenAI Codex"},
+++\t\t\t\tEnabled:    false,
+++\t\t\t\tHealth:     providerpkg.HealthRecord{ProviderID: providerpkg.Codex, State: providerpkg.StateDisabled},
+++\t\t\t},
+++\t\t},
+++\t\taccounts: []controlpkg.AccountResource{{

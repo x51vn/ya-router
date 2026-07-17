@@ -1,0 +1,362 @@
++func (codexManagedAuthAdapter) Anonymous(context.Context) (managedCredential, error) {
++	return managedCredential{}, fmt.Errorf("Codex does not support anonymous authentication")
++}
++
++type kiloManagedAuthAdapter struct{}
++
++func (kiloManagedAuthAdapter) BeginDevice(context.Context) (authChallenge, error) {
++	return authChallenge{}, fmt.Errorf("Kilo does not support device-code authentication")
++}
++func (kiloManagedAuthAdapter) FromSecret(_ context.Context, mode string, value []byte) (managedCredential, error) {
++	if mode != "api_key" {
++		return managedCredential{}, fmt.Errorf("Kilo supports api_key or anonymous")
++	}
++	return managedCredential{KiloKey: append([]byte(nil), value...)}, nil
++}
++func (kiloManagedAuthAdapter) Anonymous(context.Context) (managedCredential, error) {
++	return managedCredential{Anonymous: true}, nil
++}
++
++func (controller *managedAuthController) RotateSecretKey(ctx context.Context, encoded []byte) error {
++	key, err := secretpkg.ParseKey(string(encoded))
++	if err != nil {
++		return err
++	}
++	defer zeroSecretBytes(key)
++	return controller.managedSecrets.rotateLocalKey(ctx, key)
++}
+diff --git a/src/auth_controller_test.go b/src/auth_controller_test.go
+new file mode 100644
+index 0000000..e3c4e2b
+--- /dev/null
++++ b/src/auth_controller_test.go
+@@ -0,0 +1,145 @@
++package yarouter
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	controlpkg "github.com/duvu/ya-router/internal/control"
++	operationpkg "github.com/duvu/ya-router/internal/operation"
++	runtimepkg "github.com/duvu/ya-router/internal/runtime"
++	secretpkg "github.com/duvu/ya-router/internal/secret"
++)
++
++type fakeAuthAdapter struct {
++	challenge  authChallenge
++	credential managedCredential
++}
++
++func (adapter fakeAuthAdapter) BeginDevice(context.Context) (authChallenge, error) {
++	return adapter.challenge, nil
++}
++func (adapter fakeAuthAdapter) FromSecret(context.Context, string, []byte) (managedCredential, error) {
++	return adapter.credential, nil
++}
++func (adapter fakeAuthAdapter) Anonymous(context.Context) (managedCredential, error) {
++	return adapter.credential, nil
++}
++
++func newAuthControllerTest(t *testing.T) (*managedAuthController, func()) {
++	t.Helper()
++	directory := t.TempDir()
++	oldOverride := configPathOverride
++	configPathOverride = filepath.Join(directory, "config.json")
++	release, err := acquireManagedConfigState("auth-test")
++	if err != nil {
++		t.Fatal(err)
++	}
++	config, err := loadConfig()
++	if err != nil {
++		t.Fatal(err)
++	}
++	runtimeManager, err := runtimepkg.NewManager(config)
++	if err != nil {
++		t.Fatal(err)
++	}
++	providers, err := newProviderManager(config, runtimeManager)
++	if err != nil {
++		t.Fatal(err)
++	}
++	operations, err := operationpkg.OpenManager(operationpkg.Options{Path: filepath.Join(directory, "operations.json")})
++	if err != nil {
++		t.Fatal(err)
++	}
++	secrets, err := secretpkg.OpenFile(filepath.Join(directory, "secrets.json"), bytes.Repeat([]byte{7}, 32))
++	if err != nil {
++		t.Fatal(err)
++	}
++	controller := newManagedAuthController(operations, &managedSecretStore{store: secrets}, providers)
++	cleanup := func() {
++		_ = operations.Close(context.Background())
++		_, _ = providers.Reconcile(context.Background(), nil)
++		_ = runtimeManager.Close(context.Background())
++		_ = release()
++		configPathOverride = oldOverride
++	}
++	return controller, cleanup
++}
++
++func TestManagedAuthAPIKeyIsWriteOnlyAndPersistsReference(t *testing.T) {
++	controller, cleanup := newAuthControllerTest(t)
++	defer cleanup()
++	auth := CodexAuthState{Mode: "api_key", APIKey: "top-secret"}
++	controller.adapters[string(ProviderCodex)] = fakeAuthAdapter{credential: managedCredential{Codex: &auth}}
++	request := controlpkg.AuthSessionStart{Provider: string(ProviderCodex), Account: "work", Mode: "api_key", Owner: "operator", IdempotencyKey: "auth-one", RequestDigest: "digest", Secret: []byte("top-secret")}
++	view, created, err := controller.StartAuthSession(context.Background(), request)
++	if err != nil || !created {
++		t.Fatalf("start: %+v %v", view, err)
++	}
++	operation := waitOperationState(t, controller.operations, view.Operation.ID, operationpkg.StateSucceeded)
++	payload, _ := json.Marshal(operation)
++	if strings.Contains(string(payload), "top-secret") {
++		t.Fatalf("operation leaked secret: %s", payload)
++	}
++	snapshot := currentConfigState().Snapshot()
++	var found bool
++	for _, account := range snapshot.Desired.Providers.Codex.Accounts {
++		if account.Label == "work" {
++			found = account.Auth.APIKeyRef != nil && account.Auth.APIKey == ""
++		}
++	}
++	if !found {
++		t.Fatalf("managed API key reference was not persisted: %+v", snapshot.Desired.Providers.Codex.Accounts)
++	}
++}
++
++func TestEnvironmentCredentialCannotBeShadowed(t *testing.T) {
++	controller, cleanup := newAuthControllerTest(t)
++	defer cleanup()
++	t.Setenv("OPENAI_API_KEY", "environment-secret")
++	_, _, err := controller.StartAuthSession(context.Background(), controlpkg.AuthSessionStart{Provider: string(ProviderCodex), Mode: "api_key", Owner: "operator", Secret: []byte("different")})
++	if err == nil || !strings.Contains(err.Error(), "read-only") {
++		t.Fatalf("expected read-only precedence error, got %v", err)
++	}
++}
++
++func TestDeviceOperationSurvivesRequestCancellation(t *testing.T) {
++	controller, cleanup := newAuthControllerTest(t)
++	defer cleanup()
++	complete := make(chan struct{})
++	auth := CodexAuthState{Mode: "chatgpt", AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour).Unix()}
++	controller.adapters[string(ProviderCodex)] = fakeAuthAdapter{challenge: authChallenge{VerificationURI: "https://example.test/device", UserCode: "ABCD-EFGH", ExpiresAt: time.Now().Add(time.Minute), Complete: func(context.Context) (managedCredential, error) {
++		<-complete
++		return managedCredential{Codex: &auth}, nil
++	}}}
++	requestContext, cancel := context.WithCancel(context.Background())
++	view, _, err := controller.StartAuthSession(requestContext, controlpkg.AuthSessionStart{Provider: string(ProviderCodex), Mode: "device_code", Owner: "operator"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	cancel()
++	close(complete)
++	operation := waitOperationState(t, controller.operations, view.Operation.ID, operationpkg.StateSucceeded)
++	if operation.State != operationpkg.StateSucceeded {
++		t.Fatalf("operation was cancelled with request: %+v", operation)
++	}
++}
++
++func waitOperationState(t *testing.T, store *operationpkg.Manager, id string, want operationpkg.State) operationpkg.Record {
++	t.Helper()
++	deadline := time.Now().Add(3 * time.Second)
++	for time.Now().Before(deadline) {
++		operation, err := store.Get(id)
++		if err == nil && operation.State == want {
++			return operation
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	operation, _ := store.Get(id)
++	t.Fatalf("operation did not reach %s: %+v", want, operation)
++	return operationpkg.Record{}
++}
+diff --git a/src/cli.go b/src/cli.go
+index 5129c58..f226abc 100644
+--- a/src/cli.go
++++ b/src/cli.go
+@@ -437,11 +437,23 @@ func handleRunWithMigration(migrationMode ConfigMigrationMode) error {
+ 		}
+ 	}
+ 
+-	runtimeManager, err := runtimepkg.NewManager(cfg)
++	configPath, err := getConfigPath()
++	if err != nil {
++		return err
++	}
++	managedSecrets, err := openManagedSecretStore(configPath)
++	if err != nil {
++		return fmt.Errorf("open secret store: %w", err)
++	}
++	effectiveConfig, err := materializeManagedSecrets(context.Background(), cfg, managedSecrets.store)
++	if err != nil {
++		return fmt.Errorf("materialize managed credentials: %w", err)
++	}
++	runtimeManager, err := runtimepkg.NewManager(effectiveConfig)
+ 	if err != nil {
+ 		return fmt.Errorf("create runtime manager: %w", err)
+ 	}
+-	providerManager, err := newProviderManager(cfg, runtimeManager)
++	providerManager, err := newProviderManager(effectiveConfig, runtimeManager)
+ 	if err != nil {
+ 		shutdownContext, cancel := context.WithTimeout(context.Background(), time.Second)
+ 		defer cancel()
+@@ -497,7 +509,7 @@ func handleRunWithMigration(migrationMode ConfigMigrationMode) error {
+ 		WriteTimeout: time.Duration(cfg.Timeouts.ServerWrite) * time.Second,
+ 		IdleTimeout:  time.Duration(cfg.Timeouts.ServerIdle) * time.Second,
+ 	}
+-	controlRuntime, err := newManagedControlRuntime(cfg, runtimeManager, providerManager)
++	controlRuntime, err := newManagedControlRuntime(cfg, runtimeManager, providerManager, managedSecrets)
+ 	if err != nil {
+ 		return fmt.Errorf("configure control service: %w", err)
+ 	}
+diff --git a/src/codex_auth.go b/src/codex_auth.go
+index ed080b0..742d84e 100644
+--- a/src/codex_auth.go
++++ b/src/codex_auth.go
+@@ -6,6 +6,7 @@
+ package yarouter
+ 
+ import (
++	"context"
+ 	"encoding/base64"
+ 	"encoding/json"
+ 	"errors"
+@@ -89,77 +90,118 @@ func codexAuthenticate(auth *CodexAuthState, save func() error) error {
+ 			return nil
+ 		}
+ 	}
++	userCode, err := beginCodexDeviceFlow(context.Background())
++	if err != nil {
++		return err
++	}
++	fmt.Printf("\nFollow these steps to sign in with ChatGPT:\n\n")
++	fmt.Printf("1. Open %s in your browser.\n", userCode.VerificationURI)
++	fmt.Printf("2. Enter this one-time code: %s\n\n", userCode.UserCode)
++	fmt.Println("Never share the device code with another person.")
++	completed, err := completeCodexDeviceFlow(context.Background(), userCode)
++	if err != nil {
++		return err
++	}
++	*auth = completed
++	if err := save(); err != nil {
++		return err
++	}
++	fmt.Println("Codex authentication successful.")
++	return nil
++}
+ 
++	type codexDeviceFlow struct {
++	DeviceAuthID    string
++	UserCode        string
++	VerificationURI string
++	Interval        int
++	ExpiresAt       time.Time
++}
++
++func beginCodexDeviceFlow(ctx context.Context) (codexDeviceFlow, error) {
+ 	apiBase := codexAuthIssuer + "/api/accounts"
+ 	requestBody, _ := json.Marshal(map[string]string{
+ 		"client_id": codexOAuthClientIDValue(),
+ 		"scope":     "openid offline_access model.request",
+ 	})
+-	request, err := http.NewRequest(http.MethodPost, apiBase+"/deviceauth/usercode", strings.NewReader(string(requestBody)))
++	request, err := http.NewRequestWithContext(ctx, http.MethodPost, apiBase+"/deviceauth/usercode", strings.NewReader(string(requestBody)))
+ 	if err != nil {
+-		return err
++		return codexDeviceFlow{}, err
+ 	}
+ 	request.Header.Set("Content-Type", "application/json")
+ 	request.Header.Set("User-Agent", codexUserAgent)
+-
+ 	response, err := sharedHTTPClient.Do(request)
+ 	if err != nil {
+-		return fmt.Errorf("device code request failed: %w", err)
++		return codexDeviceFlow{}, fmt.Errorf("device code request failed: %w", err)
+ 	}
+ 	defer response.Body.Close()
+ 	if response.StatusCode != http.StatusOK {
+ 		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+-		return fmt.Errorf("device code request returned %d: %s", response.StatusCode, redactAuthError(body))
++		return codexDeviceFlow{}, fmt.Errorf("device code request returned %d: %s", response.StatusCode, redactAuthError(body))
+ 	}
+-
+-	var userCode codexUserCodeResp
+-	if err := json.NewDecoder(response.Body).Decode(&userCode); err != nil {
+-		return fmt.Errorf("decode device code response: %w", err)
++	var result codexUserCodeResp
++	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
++		return codexDeviceFlow{}, fmt.Errorf("decode device code response: %w", err)
+ 	}
+-	if userCode.DeviceAuthID == "" || userCode.UserCode == "" {
+-		return errors.New("device code response is incomplete")
++	if result.DeviceAuthID == "" || result.UserCode == "" {
++		return codexDeviceFlow{}, errors.New("device code response is incomplete")
+ 	}
+ 	interval := 5
+-	if parsed, err := parseInt(userCode.Interval); err == nil && parsed > 0 {
++	if parsed, err := parseInt(result.Interval); err == nil && parsed > 0 {
+ 		interval = parsed
+ 	}
++	expiresAt := time.Now().Add(codexDeviceAuthorizationTTL)
++	if parsed, err := time.Parse(time.RFC3339, result.ExpiresAt); err == nil {
++		expiresAt = parsed
++	}
++	return codexDeviceFlow{
++		DeviceAuthID:    result.DeviceAuthID,
++		UserCode:        result.UserCode,
++		VerificationURI: codexAuthIssuer + "/codex/device",
++		Interval:        interval,
++		ExpiresAt:       expiresAt,
++	}, nil
++}
+ 
+-	fmt.Printf("\nFollow these steps to sign in with ChatGPT:\n\n")
+-	fmt.Printf("1. Open %s/codex/device in your browser.\n", codexAuthIssuer)
+-	fmt.Printf("2. Enter this one-time code: %s\n\n", userCode.UserCode)
+-	fmt.Println("Never share the device code with another person.")
+-
+-	deadline := time.Now().Add(codexDeviceAuthorizationTTL)
++func completeCodexDeviceFlow(ctx context.Context, flow codexDeviceFlow) (CodexAuthState, error) {
++	apiBase := codexAuthIssuer + "/api/accounts"
++	deadline := flow.ExpiresAt
++	if deadline.IsZero() {
++		deadline = time.Now().Add(codexDeviceAuthorizationTTL)
++	}
+ 	var deviceToken codexDeviceTokenResp
+ 	for time.Now().Before(deadline) {
+-		time.Sleep(time.Duration(interval) * time.Second)
+-		candidate, status, pollErr := pollCodexDeviceToken(apiBase, userCode.DeviceAuthID, userCode.UserCode)
++		timer := time.NewTimer(time.Duration(flow.Interval) * time.Second)
++		select {
++		case <-ctx.Done():
++			timer.Stop()
++			return CodexAuthState{}, ctx.Err()
++		case <-timer.C:
++		}
++		candidate, status, pollErr := pollCodexDeviceTokenContext(ctx, apiBase, flow.DeviceAuthID, flow.UserCode)
+ 		if pollErr != nil {
+-			return pollErr
++			return CodexAuthState{}, pollErr
+ 		}
+ 		if status == http.StatusForbidden || status == http.StatusNotFound {
+ 			continue
+ 		}
+ 		if status != http.StatusOK {
+-			return fmt.Errorf("device authorization poll returned status %d", status)
++			return CodexAuthState{}, fmt.Errorf("device authorization poll returned status %d", status)
+ 		}
+ 		deviceToken = *candidate
+ 		break
+ 	}
+ 	if deviceToken.AuthorizationCode == "" || deviceToken.CodeVerifier == "" {
+-		return errors.New("device authorization timed out")
++		return CodexAuthState{}, errors.New("device authorization timed out")
+ 	}
+-
+-	tokens, err := exchangeCodexAuthCode(deviceToken.AuthorizationCode, deviceToken.CodeVerifier)

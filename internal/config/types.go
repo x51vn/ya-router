@@ -15,12 +15,31 @@ type Routing struct {
 	DefaultProvider       string                   `json:"default_provider"`
 	ShowUnavailableModels bool                     `json:"show_unavailable_models"`
 	ModelMap              map[string]ModelMapEntry `json:"model_map,omitempty"`
+	// ClaudeAliases projects Claude Code-discoverable model IDs onto canonical
+	// ya-router provider-prefixed models without changing the OpenAI catalog.
+	ClaudeAliases map[string]string `json:"claude_aliases,omitempty"`
+	// VirtualModels defines umbrella/virtual model IDs (for example
+	// "router/auto") that resolve to exactly one active provider-prefixed
+	// target selected deterministically before dispatch. This is
+	// selection-before-dispatch, not cross-provider failover.
+	VirtualModels map[string]VirtualModel `json:"virtual_models,omitempty"`
 }
 
 // ModelMapEntry explicitly maps a model name to a provider and optional upstream alias.
 type ModelMapEntry struct {
 	Provider      string `json:"provider"`
 	UpstreamModel string `json:"upstream_model,omitempty"`
+}
+
+// VirtualModelStrategyPriority selects the first routable target in configured
+// order. It is the only strategy supported in v1.
+const VirtualModelStrategyPriority = "priority"
+
+// VirtualModel is one umbrella model. In v1 it carries a single strategy and an
+// ordered list of canonical provider-prefixed target model IDs.
+type VirtualModel struct {
+	Strategy string   `json:"strategy"`
+	Targets  []string `json:"targets"`
 }
 
 // CopilotAuthState holds persisted Copilot authentication state. Direct secret
@@ -117,11 +136,19 @@ type Timeouts struct {
 	IdleConnTimeout int `json:"idle_conn_timeout"`
 }
 
+// Logging controls the shared application log outputs and local retention.
+type Logging struct {
+	FilePath       string `json:"file_path"`
+	MaxFileSizeMiB int    `json:"max_file_size_mib"`
+	RetainedFiles  int    `json:"retained_files"`
+}
+
 // Config is the top-level application configuration (V1 schema).
 type Config struct {
 	Port          int       `json:"port"`
 	ConfigVersion int       `json:"config_version"`
 	EnablePprof   bool      `json:"enable_pprof"`
+	Logging       Logging   `json:"logging"`
 	Routing       Routing   `json:"routing"`
 	Providers     Providers `json:"providers"`
 	Timeouts      Timeouts  `json:"timeouts"`

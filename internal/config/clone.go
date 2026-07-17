@@ -8,6 +8,7 @@ func Clone(source *Config) *Config {
 	}
 	cloned := *source
 	cloned.Routing.ModelMap = cloneModelMap(source.Routing.ModelMap)
+	cloned.Routing.VirtualModels = cloneVirtualModels(source.Routing.VirtualModels)
 	cloned.Providers.Copilot.Auth = cloneCopilotAuth(source.Providers.Copilot.Auth)
 	cloned.Providers.Copilot.AllowedModels = cloneStrings(source.Providers.Copilot.AllowedModels)
 	cloned.Providers.Copilot.Accounts = cloneCopilotAccounts(source.Providers.Copilot.Accounts)
@@ -26,6 +27,18 @@ func cloneModelMap(source map[string]ModelMapEntry) map[string]ModelMapEntry {
 	}
 	cloned := make(map[string]ModelMapEntry, len(source))
 	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneVirtualModels(source map[string]VirtualModel) map[string]VirtualModel {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string]VirtualModel, len(source))
+	for key, value := range source {
+		value.Targets = cloneStrings(value.Targets)
 		cloned[key] = value
 	}
 	return cloned

@@ -1,0 +1,340 @@
++	return &APIError{Status: status, Code: "control_http_error", Message: http.StatusText(status), RequestID: requestID}
++}
++
++func resolveToken(profile Profile) (string, error) {
++	if name := strings.TrimSpace(profile.OIDCTokenEnv); name != "" {
++		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
++			return value, nil
++		}
++	}
++	if name := strings.TrimSpace(profile.TokenEnv); name != "" {
++		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
++			return value, nil
++		}
++		return "", fmt.Errorf("control token environment variable %s is empty", name)
++	}
++	if path := strings.TrimSpace(profile.TokenFile); path != "" {
++		data, err := os.ReadFile(path)
++		if err != nil {
++			return "", err
++		}
++		return strings.TrimSpace(string(data)), nil
++	}
++	return "", nil
++}
++
++func profileTLS(profile Profile) (*tls.Config, error) {
++	config := &tls.Config{MinVersion: tls.VersionTLS12}
++	if profile.CAFile != "" {
++		data, err := os.ReadFile(profile.CAFile)
++		if err != nil {
++			return nil, err
++		}
++		pool := x509.NewCertPool()
++		if !pool.AppendCertsFromPEM(data) {
++			return nil, fmt.Errorf("client CA file contains no certificates")
++		}
++		config.RootCAs = pool
++	}
++	if profile.ClientCert != "" || profile.ClientKey != "" {
++		if profile.ClientCert == "" || profile.ClientKey == "" {
++			return nil, fmt.Errorf("both client certificate and key are required")
++		}
++		certificate, err := tls.LoadX509KeyPair(profile.ClientCert, profile.ClientKey)
++		if err != nil {
++			return nil, err
++		}
++		config.Certificates = []tls.Certificate{certificate}
++	}
++	return config, nil
++}
++
++type AuthSessionRequest struct {
++	Provider         string `json:"provider"`
++	Account          string `json:"account,omitempty"`
++	Mode             string `json:"mode"`
++	APIKey           string `json:"api_key,omitempty"`
++	RecoveryToken    string `json:"recovery_token,omitempty"`
++	ExpiresInSeconds int64  `json:"expires_in_seconds,omitempty"`
++}
++
++type AuthSessionResource struct {
++	Operation       controlpkg.OperationResource `json:"operation"`
++	Provider        string                       `json:"provider"`
++	Account         string                       `json:"account,omitempty"`
++	Mode            string                       `json:"mode"`
++	VerificationURI string                       `json:"verification_uri,omitempty"`
++	UserCode        string                       `json:"user_code,omitempty"`
++}
++
++func (client *Client) Operation(ctx context.Context, id string) (controlpkg.OperationResource, error) {
++	var result controlpkg.OperationResource
++	err := client.do(ctx, http.MethodGet, "/control/v1/operations/"+pathSegment(id), nil, "", &result, true)
++	return result, err
++}
++
++func (client *Client) CancelOperation(ctx context.Context, id, key string) (controlpkg.OperationResource, error) {
++	var result controlpkg.OperationResource
++	err := client.Mutate(ctx, http.MethodDelete, "/control/v1/operations/"+pathSegment(id), nil, key, &result)
++	return result, err
++}
++
++func (client *Client) StartAuthSession(ctx context.Context, request AuthSessionRequest, key string) (AuthSessionResource, error) {
++	var result AuthSessionResource
++	err := client.Mutate(ctx, http.MethodPost, "/control/v1/auth-sessions", request, key, &result)
++	return result, err
++}
++func (client *Client) AuthSession(ctx context.Context, id string) (AuthSessionResource, error) {
++	var result AuthSessionResource
++	err := client.do(ctx, http.MethodGet, "/control/v1/auth-sessions/"+pathSegment(id), nil, "", &result, true)
++	return result, err
++}
++func (client *Client) CancelAuthSession(ctx context.Context, id, key string) (AuthSessionResource, error) {
++	var result AuthSessionResource
++	err := client.Mutate(ctx, http.MethodDelete, "/control/v1/auth-sessions/"+pathSegment(id), nil, key, &result)
++	return result, err
++}
++
++func (client *Client) ValidateConfig(ctx context.Context, desired *configschema.Config, key string) (statepkg.Preview, error) {
++	var result statepkg.Preview
++	err := client.Mutate(ctx, http.MethodPost, "/control/v1/config:validate", map[string]any{"desired": desired}, key, &result)
++	return result, err
++}
++func (client *Client) ApplyConfig(ctx context.Context, revision uint64, desired *configschema.Config, key string) (controlpkg.MutationResult, error) {
++	var result controlpkg.MutationResult
++	err := client.Mutate(ctx, http.MethodPatch, "/control/v1/config", map[string]any{"expected_revision": revision, "desired": desired}, key, &result)
++	return result, err
++}
++func (client *Client) RollbackConfig(ctx context.Context, revision uint64, key string) (controlpkg.MutationResult, error) {
++	var result controlpkg.MutationResult
++	err := client.Mutate(ctx, http.MethodPost, "/control/v1/config:rollback", map[string]any{"expected_revision": revision}, key, &result)
++	return result, err
++}
++func (client *Client) PatchProvider(ctx context.Context, revision uint64, provider string, patch controlpkg.ProviderPatch, key string) (controlpkg.MutationResult, error) {
++	var result controlpkg.MutationResult
++	body := map[string]any{"expected_revision": revision}
++	if patch.Enabled != nil {
++		body["enabled"] = *patch.Enabled
++	}
++	if patch.AllowedModels != nil {
++		body["allowed_models"] = *patch.AllowedModels
++	}
++	err := client.Mutate(ctx, http.MethodPatch, "/control/v1/providers/"+pathSegment(provider), body, key, &result)
++	return result, err
++}
++func (client *Client) PatchAccount(ctx context.Context, revision uint64, provider, account string, patch controlpkg.AccountPatch, key string) (controlpkg.MutationResult, error) {
++	var result controlpkg.MutationResult
++	body := map[string]any{"expected_revision": revision}
++	if patch.Enabled != nil {
++		body["enabled"] = *patch.Enabled
++	}
++	if patch.Label != nil {
++		body["label"] = *patch.Label
++	}
++	if patch.Priority != nil {
++		body["priority"] = *patch.Priority
++	}
++	err := client.Mutate(ctx, http.MethodPatch, "/control/v1/providers/"+pathSegment(provider)+"/accounts/"+pathSegment(account), body, key, &result)
++	return result, err
++}
++func (client *Client) DeleteAccount(ctx context.Context, revision uint64, provider, account, key string) (controlpkg.MutationResult, error) {
++	var result controlpkg.MutationResult
++	path := "/control/v1/providers/" + pathSegment(provider) + "/accounts/" + pathSegment(account)
++	// The API requires If-Match. Use a dedicated request to avoid embedding a
++	// secret-bearing or ambiguous body in DELETE.
++	return result, client.mutateWithRevision(ctx, http.MethodDelete, path, revision, nil, key, &result)
++}
++func (client *Client) PatchRouting(ctx context.Context, revision uint64, patch controlpkg.RoutingPatch, key string) (controlpkg.MutationResult, error) {
++	var result controlpkg.MutationResult
++	body := map[string]any{"expected_revision": revision}
++	if patch.DefaultModel != nil {
++		body["default_model"] = *patch.DefaultModel
++	}
++	if patch.DefaultProvider != nil {
++		body["default_provider"] = *patch.DefaultProvider
++	}
++	if patch.ModelMap != nil {
++		body["model_map"] = *patch.ModelMap
++	}
++	err := client.Mutate(ctx, http.MethodPatch, "/control/v1/routing", body, key, &result)
++	return result, err
++}
++func (client *Client) RotateSecretKey(ctx context.Context, newKey, key string) error {
++	return client.Mutate(ctx, http.MethodPost, "/control/v1/secrets:rotate", map[string]string{"new_key": newKey}, key, nil)
++}
++
++func (client *Client) mutateWithRevision(ctx context.Context, method, path string, revision uint64, body any, key string, result any) error {
++	meta, err := client.Meta(ctx)
++	if err != nil {
++		return err
++	}
++	if !meta.Client.Compatible {
++		return &APIError{Status: http.StatusUpgradeRequired, Code: "unsupported_client_version", Message: "client/server versions are incompatible"}
++	}
++	payload, err := json.Marshal(body)
++	if err != nil {
++		return err
++	}
++	request, err := http.NewRequestWithContext(ctx, method, client.baseURL+path, bytes.NewReader(payload))
++	if err != nil {
++		return err
++	}
++	request.Header.Set(controlpkg.ClientVersionHeader, ClientVersion)
++	request.Header.Set(controlpkg.IdempotencyKeyHeader, key)
++	request.Header.Set("If-Match", fmt.Sprintf("\"%d\"", revision))
++	if client.token != "" {
++		request.Header.Set("Authorization", "Bearer "+client.token)
++	}
++	response, err := client.http.Do(request)
++	if err != nil {
++		return err
++	}
++	data, readErr := io.ReadAll(io.LimitReader(response.Body, 8<<20))
++	_ = response.Body.Close()
++	if readErr != nil {
++		return readErr
++	}
++	if response.StatusCode < 200 || response.StatusCode >= 300 {
++		return decodeAPIError(response.StatusCode, response.Header.Get(controlpkg.RequestIDHeader), data)
++	}
++	if result != nil && len(bytes.TrimSpace(data)) > 0 {
++		return json.Unmarshal(data, result)
++	}
++	return nil
++}
++
++func pathSegment(value string) string {
++	return strings.NewReplacer("/", "", "\\", "", "..", "").Replace(strings.TrimSpace(value))
++}
+diff --git a/internal/client/client_test.go b/internal/client/client_test.go
+new file mode 100644
+index 0000000..651b7d2
+--- /dev/null
++++ b/internal/client/client_test.go
+@@ -0,0 +1,76 @@
++package client
++
++import (
++	"context"
++	"encoding/json"
++	"io"
++	"net/http"
++	"strings"
++	"sync/atomic"
++	"testing"
++)
++
++type roundTripFunc func(*http.Request) (*http.Response, error)
++
++func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
++	return function(request)
++}
++
++func jsonResponse(status int, value any) *http.Response {
++	payload, _ := json.Marshal(value)
++	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(payload)))}
++}
++
++func TestMutationChecksCompatibilityBeforeDispatch(t *testing.T) {
++	var calls atomic.Int32
++	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
++		calls.Add(1)
++		if request.URL.Path == "/control/v1/meta" {
++			return jsonResponse(http.StatusOK, map[string]any{"client_compatibility": map[string]any{"minimum": "1.0.0", "maximum": "1.1.x", "current": "1.1.0", "compatible": false}}), nil
++		}
++		t.Fatalf("mutation was dispatched despite incompatibility: %s", request.URL.Path)
++		return nil, nil
++	})}
++	client, err := New(Options{Profile: Profile{URL: "https://control.test"}, HTTP: httpClient})
++	if err != nil {
++		t.Fatal(err)
++	}
++	err = client.Mutate(context.Background(), http.MethodPatch, "/control/v1/config", map[string]any{"value": 1}, "key", nil)
++	apiError, ok := err.(*APIError)
++	if !ok || apiError.Status != http.StatusUpgradeRequired || calls.Load() != 1 {
++		t.Fatalf("unexpected compatibility result: err=%v calls=%d", err, calls.Load())
++	}
++}
++
++func TestMutationRetryPreservesIdempotencyKeyAndBody(t *testing.T) {
++	var calls atomic.Int32
++	var firstBody string
++	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
++		if request.URL.Path == "/control/v1/meta" {
++			return jsonResponse(http.StatusOK, map[string]any{"client_compatibility": map[string]any{"minimum": "1.0.0", "maximum": "1.1.x", "current": "1.1.0", "compatible": true}}), nil
++		}
++		body, _ := io.ReadAll(request.Body)
++		if request.Header.Get("Idempotency-Key") != "stable-key" {
++			t.Fatal("idempotency key changed")
++		}
++		if calls.Add(1) == 1 {
++			firstBody = string(body)
++			return jsonResponse(http.StatusServiceUnavailable, map[string]any{"error": map[string]any{"code": "temporary", "message": "retry", "retryable": true, "request_id": "req_retry"}}), nil
++		}
++		if string(body) != firstBody {
++			t.Fatalf("body changed: %q != %q", body, firstBody)
++		}
++		return jsonResponse(http.StatusOK, map[string]any{"revision": 2}), nil
++	})}
++	client, err := New(Options{Profile: Profile{URL: "https://control.test"}, HTTP: httpClient})
++	if err != nil {
++		t.Fatal(err)
++	}
++	var result map[string]any
++	if err := client.Mutate(context.Background(), http.MethodPatch, "/control/v1/config", map[string]any{"enabled": true}, "stable-key", &result); err != nil {
++		t.Fatal(err)
++	}
++	if calls.Load() != 2 || result["revision"].(float64) != 2 {
++		t.Fatalf("calls=%d result=%v", calls.Load(), result)
++	}
++}
+diff --git a/openspec/changes/add-managed-service-and-tui/tasks.md b/openspec/changes/add-managed-service-and-tui/tasks.md
+index fe4219a..2fe2571 100644
+--- a/openspec/changes/add-managed-service-and-tui/tasks.md
++++ b/openspec/changes/add-managed-service-and-tui/tasks.md
+@@ -20,7 +20,7 @@
+ - [x] [YA-TUI-06 (#12)](https://github.com/duvu/ya-router/issues/12) add async operation/auth-session framework.
+ - [x] [YA-TUI-07 (#13)](https://github.com/duvu/ya-router/issues/13) add provider auth adapters and secret store.
+ - [x] [YA-TUI-08 (#14)](https://github.com/duvu/ya-router/issues/14) add revision-safe mutations and hot reload.
+-- [ ] [YA-TUI-09 (#15)](https://github.com/duvu/ya-router/issues/15) add client SDK and scriptable commands.
++- [x] [YA-TUI-09 (#15)](https://github.com/duvu/ya-router/issues/15) add client SDK and scriptable commands.
+ - [ ] [YA-TUI-10 (#16)](https://github.com/duvu/ya-router/issues/16) add read-only TUI.
+ - [ ] [YA-TUI-11 (#17)](https://github.com/duvu/ya-router/issues/17) add auth and mutation TUI workflows.
+ - [ ] [YA-TUI-12 (#18)](https://github.com/duvu/ya-router/issues/18) add production packaging/hardening.
+diff --git a/src/client_cli.go b/src/client_cli.go
+new file mode 100644
+index 0000000..19e5c96
+--- /dev/null
++++ b/src/client_cli.go
+@@ -0,0 +1,196 @@
++package yarouter
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"flag"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"time"
++
++	clientpkg "github.com/duvu/ya-router/internal/client"
++)
++
++const (
++	clientExitSuccess       = 0
++	clientExitGeneric       = 1
++	clientExitUsage         = 2
++	clientExitAuthorization = 3
++	clientExitCompatibility = 4
++	clientExitConflict      = 5
++	clientExitConnection    = 6
++)
++
++func ExecuteClient(args []string) int {

@@ -1,0 +1,383 @@
++	tokens, err := exchangeCodexAuthCodeContext(ctx, deviceToken.AuthorizationCode, deviceToken.CodeVerifier)
+ 	if err != nil {
+-		return fmt.Errorf("token exchange failed: %w", err)
++		return CodexAuthState{}, fmt.Errorf("token exchange failed: %w", err)
+ 	}
+ 	if tokens.AccessToken == "" || tokens.RefreshToken == "" {
+-		return errors.New("token exchange response is incomplete")
++		return CodexAuthState{}, errors.New("token exchange response is incomplete")
+ 	}
+-	auth.Mode = "chatgpt"
+-	auth.AccessToken = tokens.AccessToken
+-	auth.RefreshToken = tokens.RefreshToken
++	auth := CodexAuthState{Mode: "chatgpt", AccessToken: tokens.AccessToken, RefreshToken: tokens.RefreshToken}
+ 	auth.AccountID = extractAccountIDFromJWT(tokens.IDToken)
+ 	if auth.AccountID == "" {
+ 		auth.AccountID = extractAccountIDFromJWT(tokens.AccessToken)
+@@ -169,19 +211,19 @@ func codexAuthenticate(auth *CodexAuthState, save func() error) error {
+ 	} else {
+ 		auth.ExpiresAt = extractJWTExpiry(tokens.AccessToken)
+ 	}
+-	if err := save(); err != nil {
+-		return err
+-	}
+-	fmt.Println("Codex authentication successful.")
+-	return nil
++	return auth, nil
+ }
+ 
+ func pollCodexDeviceToken(apiBase, deviceAuthID, userCode string) (*codexDeviceTokenResp, int, error) {
++	return pollCodexDeviceTokenContext(context.Background(), apiBase, deviceAuthID, userCode)
++}
++
++func pollCodexDeviceTokenContext(ctx context.Context, apiBase, deviceAuthID, userCode string) (*codexDeviceTokenResp, int, error) {
+ 	body, _ := json.Marshal(map[string]string{
+ 		"device_auth_id": deviceAuthID,
+ 		"user_code":      userCode,
+ 	})
+-	request, err := http.NewRequest(http.MethodPost, apiBase+"/deviceauth/token", strings.NewReader(string(body)))
++	request, err := http.NewRequestWithContext(ctx, http.MethodPost, apiBase+"/deviceauth/token", strings.NewReader(string(body)))
+ 	if err != nil {
+ 		return nil, 0, err
+ 	}
+@@ -203,6 +245,10 @@ func pollCodexDeviceToken(apiBase, deviceAuthID, userCode string) (*codexDeviceT
+ }
+ 
+ func exchangeCodexAuthCode(authCode, codeVerifier string) (*codexOAuthTokenResp, error) {
++	return exchangeCodexAuthCodeContext(context.Background(), authCode, codeVerifier)
++}
++
++func exchangeCodexAuthCodeContext(ctx context.Context, authCode, codeVerifier string) (*codexOAuthTokenResp, error) {
+ 	form := url.Values{
+ 		"grant_type":    {"authorization_code"},
+ 		"code":          {authCode},
+@@ -210,7 +256,7 @@ func exchangeCodexAuthCode(authCode, codeVerifier string) (*codexOAuthTokenResp,
+ 		"client_id":     {codexOAuthClientIDValue()},
+ 		"code_verifier": {codeVerifier},
+ 	}
+-	request, err := http.NewRequest(http.MethodPost, codexAuthIssuer+"/oauth/token", strings.NewReader(form.Encode()))
++	request, err := http.NewRequestWithContext(ctx, http.MethodPost, codexAuthIssuer+"/oauth/token", strings.NewReader(form.Encode()))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/src/config_persistence.go b/src/config_persistence.go
+index 2dbb7b6..c8db66a 100644
+--- a/src/config_persistence.go
++++ b/src/config_persistence.go
+@@ -1,6 +1,9 @@
+ package yarouter
+ 
+-import "fmt"
++import (
++	"context"
++	"fmt"
++)
+ 
+ func saveConfig(cfg *Config) error {
+ 	configWriteMu.Lock()
+@@ -38,7 +41,9 @@ func persistCopilotRuntimeAccount(source *Config, accountIndex int) error {
+ 		return err
+ 	}
+ 	if len(source.Providers.Copilot.Accounts) == 0 {
+-		latest.Providers.Copilot.Auth = source.Providers.Copilot.Auth
++		if err := mergeManagedCopilotAuth(&latest.Providers.Copilot.Auth, source.Providers.Copilot.Auth); err != nil {
++			return err
++		}
+ 		return saveConfigLocked(latest)
+ 	}
+ 	if accountIndex < 0 || accountIndex >= len(source.Providers.Copilot.Accounts) {
+@@ -48,7 +53,9 @@ func persistCopilotRuntimeAccount(source *Config, accountIndex int) error {
+ 	for index := range latest.Providers.Copilot.Accounts {
+ 		candidate := &latest.Providers.Copilot.Accounts[index]
+ 		if sameAccount(sourceAccount.ID, sourceAccount.Label, candidate.ID, candidate.Label) {
+-			candidate.Auth = sourceAccount.Auth
++			if err := mergeManagedCopilotAuth(&candidate.Auth, sourceAccount.Auth); err != nil {
++				return err
++			}
+ 			candidate.LastLimitedAt = sourceAccount.LastLimitedAt
+ 			return saveConfigLocked(latest)
+ 		}
+@@ -64,7 +71,9 @@ func persistCodexRuntimeAccount(source *Config, accountIndex int) error {
+ 		return err
+ 	}
+ 	if len(source.Providers.Codex.Accounts) == 0 {
+-		latest.Providers.Codex.Auth = source.Providers.Codex.Auth
++		if err := mergeManagedCodexAuth(&latest.Providers.Codex.Auth, source.Providers.Codex.Auth); err != nil {
++			return err
++		}
+ 		return saveConfigLocked(latest)
+ 	}
+ 	if accountIndex < 0 || accountIndex >= len(source.Providers.Codex.Accounts) {
+@@ -74,7 +83,9 @@ func persistCodexRuntimeAccount(source *Config, accountIndex int) error {
+ 	for index := range latest.Providers.Codex.Accounts {
+ 		candidate := &latest.Providers.Codex.Accounts[index]
+ 		if sameAccount(sourceAccount.ID, sourceAccount.Label, candidate.ID, candidate.Label) {
+-			candidate.Auth = sourceAccount.Auth
++			if err := mergeManagedCodexAuth(&candidate.Auth, sourceAccount.Auth); err != nil {
++				return err
++			}
+ 			candidate.LastLimitedAt = sourceAccount.LastLimitedAt
+ 			return saveConfigLocked(latest)
+ 		}
+@@ -88,3 +99,125 @@ func sameAccount(sourceID, sourceLabel, candidateID, candidateLabel string) bool
+ 	}
+ 	return sourceLabel != "" && sourceLabel == candidateLabel
+ }
++
++func mergeManagedCopilotAuth(destination *CopilotAuthState, source CopilotAuthState) error {
++	if destination == nil {
++		return nil
++	}
++	if destination.GitHubTokenRef == nil && destination.CopilotTokenRef == nil {
++		*destination = source
++		return nil
++	}
++	managed, err := openManagedSecretStoreForPersistence()
++	if err != nil {
++		return err
++	}
++	newGitHub, newCopilot := destination.GitHubTokenRef, destination.CopilotTokenRef
++	created := make([]*SecretReference, 0, 2)
++	if source.GitHubToken != "" {
++		value := []byte(source.GitHubToken)
++		defer zeroSecretBytes(value)
++		newGitHub, err = managed.store.Put(context.Background(), "copilot/runtime/github-token", value)
++		if err != nil {
++			return err
++		}
++		created = append(created, newGitHub)
++	}
++	if source.CopilotToken != "" {
++		value := []byte(source.CopilotToken)
++		defer zeroSecretBytes(value)
++		newCopilot, err = managed.store.Put(context.Background(), "copilot/runtime/copilot-token", value)
++		if err != nil {
++			for _, ref := range created {
++				_ = managed.store.Delete(context.Background(), ref)
++			}
++			return err
++		}
++		created = append(created, newCopilot)
++	}
++	old := []*SecretReference{destination.GitHubTokenRef, destination.CopilotTokenRef}
++	*destination = CopilotAuthState{Mode: source.Mode, GitHubTokenRef: newGitHub, CopilotTokenRef: newCopilot, ExpiresAt: source.ExpiresAt, RefreshIn: source.RefreshIn}
++	newIDs := map[string]struct{}{}
++	for _, ref := range []*SecretReference{newGitHub, newCopilot} {
++		if ref != nil {
++			newIDs[ref.ID] = struct{}{}
++		}
++	}
++	for _, ref := range old {
++		if ref != nil {
++			if _, keep := newIDs[ref.ID]; !keep {
++				_ = managed.store.Delete(context.Background(), ref)
++			}
++		}
++	}
++	return nil
++}
++
++func mergeManagedCodexAuth(destination *CodexAuthState, source CodexAuthState) error {
++	if destination == nil {
++		return nil
++	}
++	if destination.APIKeyRef == nil && destination.AccessTokenRef == nil && destination.RefreshTokenRef == nil {
++		*destination = source
++		return nil
++	}
++	managed, err := openManagedSecretStoreForPersistence()
++	if err != nil {
++		return err
++	}
++	apiRef, accessRef, refreshRef := destination.APIKeyRef, destination.AccessTokenRef, destination.RefreshTokenRef
++	created := make([]*SecretReference, 0, 3)
++	put := func(name, value string, current **SecretReference) error {
++		if value == "" {
++			return nil
++		}
++		bytes := []byte(value)
++		defer zeroSecretBytes(bytes)
++		ref, err := managed.store.Put(context.Background(), name, bytes)
++		if err != nil {
++			return err
++		}
++		*current = ref
++		created = append(created, ref)
++		return nil
++	}
++	if err := put("codex/runtime/api-key", source.APIKey, &apiRef); err != nil {
++		return err
++	}
++	if err := put("codex/runtime/access-token", source.AccessToken, &accessRef); err != nil {
++		for _, ref := range created {
++			_ = managed.store.Delete(context.Background(), ref)
++		}
++		return err
++	}
++	if err := put("codex/runtime/refresh-token", source.RefreshToken, &refreshRef); err != nil {
++		for _, ref := range created {
++			_ = managed.store.Delete(context.Background(), ref)
++		}
++		return err
++	}
++	old := []*SecretReference{destination.APIKeyRef, destination.AccessTokenRef, destination.RefreshTokenRef}
++	*destination = CodexAuthState{Mode: source.Mode, APIKeyRef: apiRef, AccessTokenRef: accessRef, RefreshTokenRef: refreshRef, ExpiresAt: source.ExpiresAt}
++	newIDs := map[string]struct{}{}
++	for _, ref := range []*SecretReference{apiRef, accessRef, refreshRef} {
++		if ref != nil {
++			newIDs[ref.ID] = struct{}{}
++		}
++	}
++	for _, ref := range old {
++		if ref != nil {
++			if _, keep := newIDs[ref.ID]; !keep {
++				_ = managed.store.Delete(context.Background(), ref)
++			}
++		}
++	}
++	return nil
++}
++
++func openManagedSecretStoreForPersistence() (*managedSecretStore, error) {
++	path, err := getConfigPath()
++	if err != nil {
++		return nil, err
++	}
++	return openManagedSecretStore(path)
++}
+diff --git a/src/control_runtime.go b/src/control_runtime.go
+index 534c638..584799f 100644
+--- a/src/control_runtime.go
++++ b/src/control_runtime.go
+@@ -39,11 +39,13 @@ type managedControlRuntime struct {
+ 	service       *controlpkg.Service
+ 	audit         *controlpkg.MemoryAuditSink
+ 	operations    *operationpkg.Manager
++	auth          *managedAuthController
++	secrets       *managedSecretStore
+ 	unixSocket    string
+ 	remoteAddress string
+ }
+ 
+-func newManagedControlRuntime(config *Config, runtimeManager *runtimepkg.Manager, providerManager *providerpkg.Manager) (*managedControlRuntime, error) {
++func newManagedControlRuntime(config *Config, runtimeManager *runtimepkg.Manager, providerManager *providerpkg.Manager, managedSecrets *managedSecretStore) (*managedControlRuntime, error) {
+ 	listenerConfig, tokens, subjectRoles, err := configuredControlListener(config)
+ 	if err != nil {
+ 		return nil, err
+@@ -62,6 +64,17 @@ func newManagedControlRuntime(config *Config, runtimeManager *runtimepkg.Manager
+ 	if err != nil {
+ 		return nil, fmt.Errorf("open operation manager: %w", err)
+ 	}
++	if managedSecrets == nil {
++		configPath, pathErr := getConfigPath()
++		if pathErr != nil {
++			return nil, pathErr
++		}
++		managedSecrets, err = openManagedSecretStore(configPath)
++		if err != nil {
++			return nil, fmt.Errorf("open secret store: %w", err)
++		}
++	}
++	authController := newManagedAuthController(operationManager, managedSecrets, providerManager)
+ 	closeOperations := true
+ 	defer func() {
+ 		if closeOperations {
+@@ -89,6 +102,9 @@ func newManagedControlRuntime(config *Config, runtimeManager *runtimepkg.Manager
+ 			"local_unix_socket",
+ 			"operation_events",
+ 			"persistent_operations",
++			"managed_authentication",
++			"write_only_secret_store",
++			"secret_key_rotation",
+ 			"request_id",
+ 			"restart_recovery",
+ 			"resumable_sse",
+@@ -111,7 +127,8 @@ func newManagedControlRuntime(config *Config, runtimeManager *runtimepkg.Manager
+ 		},
+ 	})
+ 	controlpkg.RegisterReadRoutes(api, newControlReadModel(runtimeManager, providerManager, operationManager))
+-	controlpkg.RegisterOperationRoutes(api, operationManager)
++	controlpkg.RegisterOperationRoutes(api, operationManager, authController)
++	controlpkg.RegisterSecretRoutes(api, authController)
+ 	localIdentity := controlpkg.Identity{Subject: "local:unix-socket", Role: controlpkg.RoleAdmin, Source: "unix_socket"}
+ 	localHandler := api.Handler(controlpkg.FixedAuthenticator(localIdentity))
+ 
+@@ -135,6 +152,8 @@ func newManagedControlRuntime(config *Config, runtimeManager *runtimepkg.Manager
+ 		service:       service,
+ 		audit:         audit,
+ 		operations:    operationManager,
++		auth:          authController,
++		secrets:       managedSecrets,
+ 		unixSocket:    listenerConfig.UnixSocket,
+ 		remoteAddress: listenerConfig.RemoteAddress,
+ 	}, nil
+diff --git a/src/secret_runtime.go b/src/secret_runtime.go
+new file mode 100644
+index 0000000..6b050fc
+--- /dev/null
++++ b/src/secret_runtime.go
+@@ -0,0 +1,244 @@
++package yarouter
++
++import (
++	"context"
++	"crypto/rand"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++
++	configschema "github.com/duvu/ya-router/internal/config"
++	secretpkg "github.com/duvu/ya-router/internal/secret"
++)
++
++const secretStoreKeyEnv = "YA_ROUTER_SECRET_STORE_KEY"
++
++type managedSecretStore struct {
++	store   *secretpkg.FileStore
++	keyPath string
++	source  string
++}
++
++func openManagedSecretStore(configPath string) (*managedSecretStore, error) {
++	directory := filepath.Dir(configPath)
++	var key []byte
++	source := "local_key_file"
++	keyPath := filepath.Join(directory, "secret-store.key")
++	if value := strings.TrimSpace(os.Getenv(secretStoreKeyEnv)); value != "" {
++		parsed, err := secretpkg.ParseKey(value)
++		if err != nil {
++			return nil, fmt.Errorf("%s: %w", secretStoreKeyEnv, err)
++		}
++		key = parsed
++		source = "environment_key"
++		keyPath = ""
++	} else {
++		data, err := os.ReadFile(keyPath)
++		if err != nil {
++			if !os.IsNotExist(err) {
++				return nil, fmt.Errorf("read secret-store key: %w", err)
++			}
++			key = make([]byte, 32)
++			if _, err := rand.Read(key); err != nil {
++				return nil, err
++			}
++			if err := writePrivateFile(keyPath, key); err != nil {
++				return nil, err
++			}
++		} else {
++			key = data
++		}
++		if len(key) != 32 {
++			return nil, fmt.Errorf("secret-store key file must contain exactly 32 bytes")
++		}
++	}
++	store, err := secretpkg.OpenFile(filepath.Join(directory, "secrets.json"), key)
++	zeroSecretBytes(key)
++	if err != nil {
++		return nil, err
++	}
++	return &managedSecretStore{store: store, keyPath: keyPath, source: source}, nil
++}
++
++func writePrivateFile(path string, value []byte) error {

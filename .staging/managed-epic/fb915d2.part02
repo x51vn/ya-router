@@ -1,0 +1,264 @@
++	return executeClient(args, os.Stdout, os.Stderr)
++}
++
++func executeClient(args []string, stdout, stderr io.Writer) int {
++	if len(args) == 0 {
++		args = []string{"ya"}
++	}
++	command := flag.NewFlagSet("ya", flag.ContinueOnError)
++	command.SetOutput(stderr)
++	profileName := command.String("profile", "", "Connection profile name")
++	profilesPath := command.String("profiles", "", "Profiles JSON path")
++	socket := command.String("socket", "", "Control API Unix socket")
++	remoteURL := command.String("url", "", "Control API HTTPS URL")
++	tokenEnv := command.String("token-env", "", "Environment variable containing a control token")
++	jsonOutput := command.Bool("json", false, "Emit stable JSON output")
++	timeout := command.Duration("timeout", 30*time.Second, "Request timeout")
++	refresh := command.Bool("refresh", false, "Force model catalog refresh")
++	after := command.Uint64("after", 0, "Event cursor")
++	if err := command.Parse(args[1:]); err != nil {
++		return clientExitUsage
++	}
++	remaining := command.Args()
++	if len(remaining) == 0 || remaining[0] == "help" {
++		printClientUsage(stdout)
++		return clientExitSuccess
++	}
++	if remaining[0] == "version" {
++		fmt.Fprintf(stdout, "ya %s\n", version)
++		return clientExitSuccess
++	}
++	profile, err := resolveClientProfile(*profilesPath, *profileName, *socket, *remoteURL, *tokenEnv)
++	if err != nil {
++		fmt.Fprintf(stderr, "ya: %v\n", err)
++		return clientExitUsage
++	}
++	controlClient, err := clientpkg.New(clientpkg.Options{Profile: profile, Timeout: *timeout})
++	if err != nil {
++		fmt.Fprintf(stderr, "ya: %v\n", err)
++		return clientExitUsage
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
++	defer cancel()
++	var value any
++	switch remaining[0] {
++	case "meta":
++		value, err = controlClient.Meta(ctx)
++	case "providers":
++		value, err = controlClient.Providers(ctx)
++	case "accounts":
++		value, err = controlClient.Accounts(ctx)
++	case "models":
++		value, err = controlClient.Models(ctx, *refresh)
++	case "config":
++		value, err = controlClient.Configuration(ctx)
++	case "operations":
++		value, err = controlClient.Operations(ctx)
++	case "events":
++		value, err = controlClient.Events(ctx, *after)
++	case "tui":
++		return executeTUI(controlClient, stdout, stderr)
++	default:
++		fmt.Fprintf(stderr, "ya: unknown command %q\n", remaining[0])
++		return clientExitUsage
++	}
++	if err != nil {
++		fmt.Fprintf(stderr, "ya: %v\n", err)
++		return clientErrorExitCode(err)
++	}
++	if err := writeClientOutput(stdout, value, *jsonOutput); err != nil {
++		fmt.Fprintf(stderr, "ya: %v\n", err)
++		return clientExitGeneric
++	}
++	return clientExitSuccess
++}
++
++func printClientUsage(writer io.Writer) {
++	fmt.Fprintln(writer, "ya — ya-router control client")
++	fmt.Fprintln(writer)
++	fmt.Fprintln(writer, "Usage: ya [options] <command>")
++	fmt.Fprintln(writer)
++	fmt.Fprintln(writer, "Commands: meta, providers, accounts, models, config, operations, events, tui, version")
++	fmt.Fprintln(writer, "Use --json for contract-stable non-interactive output.")
++}
++
++func resolveClientProfile(profilesPath, profileName, socket, remoteURL, tokenEnv string) (clientpkg.Profile, error) {
++	var profile clientpkg.Profile
++	if profileName != "" || profilesPath != "" {
++		profiles, err := clientpkg.LoadProfiles(profilesPath)
++		if err != nil {
++			return profile, err
++		}
++		profile, err = profiles.Resolve(profileName)
++		if err != nil {
++			return profile, err
++		}
++	}
++	if socket != "" {
++		profile.UnixSocket = socket
++		profile.URL = ""
++	}
++	if remoteURL != "" {
++		profile.URL = remoteURL
++		profile.UnixSocket = ""
++	}
++	if tokenEnv != "" {
++		profile.TokenEnv = tokenEnv
++	}
++	if profile.UnixSocket == "" && profile.URL == "" {
++		if configured := strings.TrimSpace(os.Getenv(controlSocketEnv)); configured != "" && !strings.EqualFold(configured, "off") && !strings.EqualFold(configured, "disabled") {
++			profile.UnixSocket = configured
++		} else {
++			path, err := getConfigPath()
++			if err != nil {
++				return profile, err
++			}
++			profile.UnixSocket = filepath.Join(filepath.Dir(path), "control.sock")
++		}
++	}
++	return profile, nil
++}
++
++func writeClientOutput(writer io.Writer, value any, contractJSON bool) error {
++	encoder := json.NewEncoder(writer)
++	if !contractJSON {
++		encoder.SetIndent("", "  ")
++	}
++	return encoder.Encode(value)
++}
++
++func clientErrorExitCode(err error) int {
++	var apiError *clientpkg.APIError
++	if errors.As(err, &apiError) {
++		switch apiError.Status {
++		case http.StatusUnauthorized, http.StatusForbidden:
++			return clientExitAuthorization
++		case http.StatusUpgradeRequired:
++			return clientExitCompatibility
++		case http.StatusConflict:
++			return clientExitConflict
++		default:
++			return clientExitGeneric
++		}
++	}
++	var networkError net.Error
++	if errors.As(err, &networkError) || errors.Is(err, os.ErrNotExist) || strings.Contains(strings.ToLower(err.Error()), "connect") {
++		return clientExitConnection
++	}
++	return clientExitGeneric
++}
++
++// Kept for shell completion generation without importing the flag package's
++// private representation.
++func clientCommandNames() []string {
++	return []string{"meta", "providers", "accounts", "models", "config", "operations", "events", "tui", "version"}
++}
++
++func parseRevision(value string) (uint64, error) {
++	return strconv.ParseUint(strings.Trim(strings.TrimSpace(value), "\""), 10, 64)
++}
++
++// executeTUI is replaced by the Bubble Tea implementation in YA-TUI-10.
++func executeTUI(_ *clientpkg.Client, _, stderr io.Writer) int {
++	fmt.Fprintln(stderr, "ya: TUI is not available in this build")
++	return clientExitUsage
++}
+diff --git a/src/client_cli_test.go b/src/client_cli_test.go
+new file mode 100644
+index 0000000..308ccb4
+--- /dev/null
++++ b/src/client_cli_test.go
+@@ -0,0 +1,51 @@
++package yarouter
++
++import (
++	"bytes"
++	"encoding/json"
++	"net"
++	"net/http"
++	"path/filepath"
++	"testing"
++)
++
++func TestClientJSONCommandWorksWithoutTTY(t *testing.T) {
++	socket := filepath.Join(t.TempDir(), "control.sock")
++	listener, err := net.Listen("unix", socket)
++	if err != nil {
++		t.Fatal(err)
++	}
++	server := &http.Server{Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
++		writer.Header().Set("Content-Type", "application/json")
++		_, _ = writer.Write([]byte(`{"data":[{"enabled":true,"descriptor":{"id":"copilot","name":"GitHub Copilot"}}]}`))
++	})}
++	go server.Serve(listener)
++	defer server.Close()
++	var stdout, stderr bytes.Buffer
++	exit := executeClient([]string{"ya", "--socket", socket, "--json", "providers"}, &stdout, &stderr)
++	if exit != 0 {
++		t.Fatalf("exit=%d stderr=%s", exit, stderr.String())
++	}
++	var payload []map[string]any
++	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
++		t.Fatalf("invalid JSON: %v: %s", err, stdout.String())
++	}
++	if len(payload) != 1 || payload[0]["enabled"] != true {
++		t.Fatalf("unexpected payload: %v", payload)
++	}
++	if bytes.Contains(stdout.Bytes(), []byte("\x1b")) {
++		t.Fatal("non-interactive JSON contains terminal escapes")
++	}
++}
++
++func TestClientStableExitCodes(t *testing.T) {
++	var stdout, stderr bytes.Buffer
++	if exit := executeClient([]string{"ya", "unknown"}, &stdout, &stderr); exit != clientExitUsage {
++		t.Fatalf("usage exit=%d", exit)
++	}
++	stdout.Reset()
++	stderr.Reset()
++	if exit := executeClient([]string{"ya", "--socket", filepath.Join(t.TempDir(), "missing.sock"), "providers"}, &stdout, &stderr); exit != clientExitConnection {
++		t.Fatalf("connection exit=%d stderr=%s", exit, stderr.String())
++	}
++}
+diff --git a/src/entrypoints_test.go b/src/entrypoints_test.go
+index f6f03df..341528f 100644
+--- a/src/entrypoints_test.go
++++ b/src/entrypoints_test.go
+@@ -11,7 +11,7 @@ func TestCompatibilityAndDaemonEntrypointsShareValidation(t *testing.T) {
+ }
+ 
+ func TestClientFoundationDoesNotMutateLocalServiceState(t *testing.T) {
+-	if got := ExecuteClient([]string{"ya", "models"}); got != 2 {
++	if got := ExecuteClient([]string{"ya", "models"}); got != clientExitConnection {
+ 		t.Fatalf("client exit=%d", got)
+ 	}
+ }
+diff --git a/src/main.go b/src/main.go
+index 7471b2b..fd9936c 100644
+--- a/src/main.go
++++ b/src/main.go
+@@ -231,21 +231,3 @@ func ExecuteDaemon(args []string) int {
+ 		return 2
+ 	}
+ }
+-
+-// ExecuteClient provides the installable client binary boundary. Control API
+-// commands and the TUI are intentionally delivered by YA-TUI-09 and -10.
+-func ExecuteClient(args []string) int {
+-	if len(args) < 2 || args[1] == "help" || args[1] == "--help" || args[1] == "-h" {
+-		fmt.Println("ya — ya-router control client")
+-		fmt.Println()
+-		fmt.Println("The client transport and TUI are not available in this foundation release.")
+-		fmt.Println("Use ya-router for the compatibility command surface.")
+-		return 0
+-	}
+-	if args[1] == "version" {
+-		fmt.Printf("ya %s\n", version)
+-		return 0
+-	}
+-	fmt.Printf("ya command %q is not available until the Control API client is implemented\n", args[1])
+-	return 2
+-}
++-- 
++2.47.3
++

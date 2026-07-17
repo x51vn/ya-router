@@ -99,8 +99,3 @@ func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
 		log.Printf("health response encoding failed: %v", err)
 	}
 }
-
-func setupLogging() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.SetPrefix("[ya-router] ")
-}

@@ -13,11 +13,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	secretpkg "github.com/duvu/ya-router/internal/secret"
 )
 
 // CopilotProvider implements Provider for the GitHub Copilot backend.
 type CopilotProvider struct {
 	cfg               *Config // full config; Copilot auth lives at cfg.Providers.Copilot
+	auth              secretpkg.AuthController
 	mu                sync.Mutex
 	accountCursor     int // index into cfg.Providers.Copilot.Accounts; protected by mu
 	cb                *CircuitBreaker
@@ -27,20 +30,6 @@ type CopilotProvider struct {
 	freeModelCursor   atomic.Uint64
 	freeModelResolver func(ctx context.Context) ([]Model, error)
 	proxyExecutor     func(ctx context.Context, r *http.Request, body []byte, cap Capability) (*http.Response, string, error)
-}
-
-// NewCopilotProvider constructs a CopilotProvider backed by cfg.
-func NewCopilotProvider(cfg *Config) *CopilotProvider {
-	timeout := time.Duration(cfg.Timeouts.CircuitBreaker) * time.Second
-	p := &CopilotProvider{
-		cfg:         cfg,
-		cb:          &CircuitBreaker{state: CircuitClosed, timeout: timeout},
-		mc:          NewCoalescingCache(),
-		cache:       NewModelCache(defaultModelCacheTTL),
-		freeCatalog: NewCopilotFreeCatalog(defaultFreeCatalogTTL),
-	}
-	p.accountCursor = p.firstHealthyAccount()
-	return p
 }
 
 func (p *CopilotProvider) ID() ProviderID { return ProviderCopilot }
@@ -130,32 +119,6 @@ func (p *CopilotProvider) advanceAccountFrom(failedIndex int) bool {
 		}
 	}
 	return false
-}
-
-// EnsureAuthenticated ensures the Copilot bearer token is valid.
-func (p *CopilotProvider) EnsureAuthenticated(ctx context.Context) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	auth := p.authState()
-	if auth.CopilotToken == "" {
-		return copilotAuthenticate(auth, p.save)
-	}
-
-	now := time.Now().Unix()
-	threshold := int64(300) // 5 min default
-	if auth.RefreshIn > 0 {
-		if t := auth.RefreshIn / 5; t > threshold {
-			threshold = t
-		}
-	}
-	if auth.ExpiresAt-now <= threshold {
-		if err := copilotRefreshToken(auth, p.save); err != nil {
-			log.Printf("Copilot refresh failed, re-authenticating: %v", err)
-			return copilotAuthenticate(auth, p.save)
-		}
-	}
-	return nil
 }
 
 func (p *CopilotProvider) ListModels(ctx context.Context) (*ModelList, error) {
@@ -308,6 +271,11 @@ func (p *CopilotProvider) credentialSnapshot() (int, string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	index := p.accountCursor
+	if p.auth != nil {
+		if credential, ok := p.auth.ResolveCredential("copilot/token"); ok {
+			return index, credential.Value
+		}
+	}
 	return index, p.authState().CopilotToken
 }
 

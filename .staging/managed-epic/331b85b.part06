@@ -1,0 +1,222 @@
++	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
++		return err
++	}
++	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
++	if err != nil {
++		return err
++	}
++	if _, err := file.Write(value); err != nil {
++		_ = file.Close()
++		_ = os.Remove(path)
++		return err
++	}
++	if err := file.Sync(); err != nil {
++		_ = file.Close()
++		return err
++	}
++	return file.Close()
++}
++
++func materializeManagedSecrets(ctx context.Context, desired *Config, store secretpkg.Store) (*Config, error) {
++	effective := configschema.Clone(desired)
++	if effective == nil {
++		return nil, fmt.Errorf("configuration is required")
++	}
++	if store == nil {
++		if hasManagedSecretReferences(effective) {
++			return nil, fmt.Errorf("managed secret references exist but the secret store is unavailable")
++		}
++		return effective, nil
++	}
++	resolve := func(reference *SecretReference, destination *string) error {
++		if reference == nil {
++			return nil
++		}
++		if reference.ReadOnly && reference.Source == "environment" {
++			return nil
++		}
++		value, err := store.Get(ctx, reference)
++		if err != nil {
++			return err
++		}
++		*destination = string(value)
++		zeroSecretBytes(value)
++		return nil
++	}
++	if err := resolve(effective.Providers.Copilot.Auth.GitHubTokenRef, &effective.Providers.Copilot.Auth.GitHubToken); err != nil {
++		return nil, err
++	}
++	if err := resolve(effective.Providers.Copilot.Auth.CopilotTokenRef, &effective.Providers.Copilot.Auth.CopilotToken); err != nil {
++		return nil, err
++	}
++	for index := range effective.Providers.Copilot.Accounts {
++		auth := &effective.Providers.Copilot.Accounts[index].Auth
++		if err := resolve(auth.GitHubTokenRef, &auth.GitHubToken); err != nil {
++			return nil, err
++		}
++		if err := resolve(auth.CopilotTokenRef, &auth.CopilotToken); err != nil {
++			return nil, err
++		}
++	}
++	if err := resolve(effective.Providers.Codex.Auth.APIKeyRef, &effective.Providers.Codex.Auth.APIKey); err != nil {
++		return nil, err
++	}
++	if err := resolve(effective.Providers.Codex.Auth.AccessTokenRef, &effective.Providers.Codex.Auth.AccessToken); err != nil {
++		return nil, err
++	}
++	if err := resolve(effective.Providers.Codex.Auth.RefreshTokenRef, &effective.Providers.Codex.Auth.RefreshToken); err != nil {
++		return nil, err
++	}
++	for index := range effective.Providers.Codex.Accounts {
++		auth := &effective.Providers.Codex.Accounts[index].Auth
++		if err := resolve(auth.APIKeyRef, &auth.APIKey); err != nil {
++			return nil, err
++		}
++		if err := resolve(auth.AccessTokenRef, &auth.AccessToken); err != nil {
++			return nil, err
++		}
++		if err := resolve(auth.RefreshTokenRef, &auth.RefreshToken); err != nil {
++			return nil, err
++		}
++	}
++	if err := resolve(effective.Providers.Kilo.APIKeyRef, &effective.Providers.Kilo.APIKey); err != nil {
++		return nil, err
++	}
++	if err := resolve(effective.Providers.Kilo.OrganizationIDRef, &effective.Providers.Kilo.OrganizationID); err != nil {
++		return nil, err
++	}
++	return effective, nil
++}
++
++func hasManagedSecretReferences(config *Config) bool {
++	if config == nil {
++		return false
++	}
++	if config.Providers.Copilot.Auth.GitHubTokenRef != nil || config.Providers.Copilot.Auth.CopilotTokenRef != nil {
++		return true
++	}
++	for _, account := range config.Providers.Copilot.Accounts {
++		if account.Auth.GitHubTokenRef != nil || account.Auth.CopilotTokenRef != nil {
++			return true
++		}
++	}
++	if config.Providers.Codex.Auth.APIKeyRef != nil || config.Providers.Codex.Auth.AccessTokenRef != nil || config.Providers.Codex.Auth.RefreshTokenRef != nil {
++		return true
++	}
++	for _, account := range config.Providers.Codex.Accounts {
++		if account.Auth.APIKeyRef != nil || account.Auth.AccessTokenRef != nil || account.Auth.RefreshTokenRef != nil {
++			return true
++		}
++	}
++	return config.Providers.Kilo.APIKeyRef != nil || config.Providers.Kilo.OrganizationIDRef != nil
++}
++
++func zeroSecretBytes(value []byte) {
++	for index := range value {
++		value[index] = 0
++	}
++}
++
++func (managed *managedSecretStore) rotateLocalKey(ctx context.Context, newKey []byte) error {
++	if managed == nil || managed.store == nil {
++		return fmt.Errorf("secret store is unavailable")
++	}
++	if managed.keyPath == "" {
++		return fmt.Errorf("secret-store key is environment-owned and read-only")
++	}
++	oldKey, err := os.ReadFile(managed.keyPath)
++	if err != nil {
++		return err
++	}
++	if err := managed.store.Rotate(ctx, newKey); err != nil {
++		zeroSecretBytes(oldKey)
++		return err
++	}
++	if err := replacePrivateFile(managed.keyPath, newKey); err != nil {
++		_ = managed.store.Rotate(context.Background(), oldKey)
++		zeroSecretBytes(oldKey)
++		return err
++	}
++	zeroSecretBytes(oldKey)
++	return nil
++}
++
++func replacePrivateFile(path string, value []byte) error {
++	directory := filepath.Dir(path)
++	file, err := os.CreateTemp(directory, filepath.Base(path)+".tmp-*")
++	if err != nil {
++		return err
++	}
++	temporary := file.Name()
++	keep := true
++	defer func() {
++		_ = file.Close()
++		if keep {
++			_ = os.Remove(temporary)
++		}
++	}()
++	if err := file.Chmod(0o600); err != nil {
++		return err
++	}
++	if _, err := file.Write(value); err != nil {
++		return err
++	}
++	if err := file.Sync(); err != nil {
++		return err
++	}
++	if err := file.Close(); err != nil {
++		return err
++	}
++	if err := os.Rename(temporary, path); err != nil {
++		return err
++	}
++	keep = false
++	dir, err := os.Open(directory)
++	if err != nil {
++		return err
++	}
++	defer dir.Close()
++	return dir.Sync()
++}
+diff --git a/src/secret_runtime_test.go b/src/secret_runtime_test.go
+new file mode 100644
+index 0000000..13f9387
+--- /dev/null
++++ b/src/secret_runtime_test.go
+@@ -0,0 +1,33 @@
++package yarouter
++
++import (
++	"bytes"
++	"context"
++	"path/filepath"
++	"testing"
++
++	secretpkg "github.com/duvu/ya-router/internal/secret"
++)
++
++func TestMaterializeManagedSecrets(t *testing.T) {
++	store, err := secretpkg.OpenFile(filepath.Join(t.TempDir(), "secrets.json"), bytes.Repeat([]byte{3}, 32))
++	if err != nil {
++		t.Fatal(err)
++	}
++	reference, err := store.Put(context.Background(), "codex/api", []byte("secret-value"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	config := defaultConfig()
++	config.Providers.Codex.Auth.APIKeyRef = reference
++	effective, err := materializeManagedSecrets(context.Background(), config, store)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if effective.Providers.Codex.Auth.APIKey != "secret-value" {
++		t.Fatalf("secret not materialized")
++	}
++	if config.Providers.Codex.Auth.APIKey != "" {
++		t.Fatal("desired config was mutated")
++	}
++}
++-- 
++2.47.3
++

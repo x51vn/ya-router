@@ -1,0 +1,400 @@
+From 8f08f50f5a077ababc65a5e4df676ac7ad40f33d Mon Sep 17 00:00:00 2001
+From: OpenAI Agent <agent@openai.local>
+Date: Thu, 16 Jul 2026 00:23:39 +0000
+Subject: [PATCH] feat(tui): deliver read-only Bubble Tea client
+
+---
+ docs/CONTROL_API.md                           |  12 +
+ docs/qa/ya-tui-10.md                          |   7 +
+ go.mod                                        |   6 +
+ .../add-managed-service-and-tui/tasks.md      |   2 +-
+ src/client_cli.go                             |   6 -
+ src/testdata/tui/compact.golden               |  17 +
+ src/testdata/tui/standard.golden              |  17 +
+ src/testdata/tui/wide.golden                  |  17 +
+ src/tui.go                                    | 451 ++++++++++++++++++
+ src/tui_test.go                               | 205 ++++++++
+ 10 files changed, 733 insertions(+), 7 deletions(-)
+ create mode 100644 docs/qa/ya-tui-10.md
+ create mode 100644 src/testdata/tui/compact.golden
+ create mode 100644 src/testdata/tui/standard.golden
+ create mode 100644 src/testdata/tui/wide.golden
+ create mode 100644 src/tui.go
+ create mode 100644 src/tui_test.go
+
+diff --git a/docs/CONTROL_API.md b/docs/CONTROL_API.md
+index c32ad55..ecd0dbe 100644
+--- a/docs/CONTROL_API.md
++++ b/docs/CONTROL_API.md
+@@ -246,3 +246,15 @@ without terminal decoration and works without a TTY. Exit codes distinguish
+ usage, authorization, compatibility, revision conflict, connection, and generic
+ failures. Mutations are not retried unless the same idempotency key and payload
+ are retained, and client/server incompatibility fails before dispatch.
++
++## Read-only Bubble Tea TUI
++
++Run `ya tui` to open the keyboard-only terminal client. It provides connection,
++overview, providers, accounts, models, configuration, operations, and lifecycle
++event screens. `Tab`/arrow keys or number keys switch screens, `r` reconnects,
++`t` cycles auto/light/dark/monochrome, and `q` exits only the client.
++
++Every state includes a text label; color is never the sole status signal. The
++TUI renders sanitized Control API errors with request IDs, does not write logs
++into the controlled terminal, and periodically reconnects without cancelling
++daemon operations.
+diff --git a/docs/qa/ya-tui-10.md b/docs/qa/ya-tui-10.md
+new file mode 100644
+index 0000000..e42b961
+--- /dev/null
++++ b/docs/qa/ya-tui-10.md
+@@ -0,0 +1,7 @@
++# YA-TUI-10 acceptance evidence
++
++- Full keyboard navigation and explicit text status labels; monochrome rendering has no ANSI color escapes.
++- Golden render tests cover compact, standard, and wide terminal classes.
++- Offline/reconnect and sanitized request-ID diagnostics are tested.
++- Quitting the TUI emits no operation cancellation or daemon lifecycle call.
++- Bubble Tea, Bubbles, and Lip Gloss are pinned to Go 1.22-compatible releases.
+diff --git a/go.mod b/go.mod
+index 448a197..771fd8d 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,3 +1,9 @@
+ module github.com/duvu/ya-router
+ 
+ go 1.22
++
++require (
++	github.com/charmbracelet/bubbles v0.20.0
++	github.com/charmbracelet/bubbletea v1.2.4
++	github.com/charmbracelet/lipgloss v1.0.0
++)
+diff --git a/openspec/changes/add-managed-service-and-tui/tasks.md b/openspec/changes/add-managed-service-and-tui/tasks.md
+index 2fe2571..5e7b115 100644
+--- a/openspec/changes/add-managed-service-and-tui/tasks.md
++++ b/openspec/changes/add-managed-service-and-tui/tasks.md
+@@ -21,7 +21,7 @@
+ - [x] [YA-TUI-07 (#13)](https://github.com/duvu/ya-router/issues/13) add provider auth adapters and secret store.
+ - [x] [YA-TUI-08 (#14)](https://github.com/duvu/ya-router/issues/14) add revision-safe mutations and hot reload.
+ - [x] [YA-TUI-09 (#15)](https://github.com/duvu/ya-router/issues/15) add client SDK and scriptable commands.
+-- [ ] [YA-TUI-10 (#16)](https://github.com/duvu/ya-router/issues/16) add read-only TUI.
++- [x] [YA-TUI-10 (#16)](https://github.com/duvu/ya-router/issues/16) add read-only TUI.
+ - [ ] [YA-TUI-11 (#17)](https://github.com/duvu/ya-router/issues/17) add auth and mutation TUI workflows.
+ - [ ] [YA-TUI-12 (#18)](https://github.com/duvu/ya-router/issues/18) add production packaging/hardening.
+ - [ ] [YA-TUI-13 (#19)](https://github.com/duvu/ya-router/issues/19) complete production acceptance gates.
+diff --git a/src/client_cli.go b/src/client_cli.go
+index 19e5c96..1ef2668 100644
+--- a/src/client_cli.go
++++ b/src/client_cli.go
+@@ -188,9 +188,3 @@ func clientCommandNames() []string {
+ func parseRevision(value string) (uint64, error) {
+ 	return strconv.ParseUint(strings.Trim(strings.TrimSpace(value), "\""), 10, 64)
+ }
+-
+-// executeTUI is replaced by the Bubble Tea implementation in YA-TUI-10.
+-func executeTUI(_ *clientpkg.Client, _, stderr io.Writer) int {
+-	fmt.Fprintln(stderr, "ya: TUI is not available in this build")
+-	return clientExitUsage
+-}
+diff --git a/src/testdata/tui/compact.golden b/src/testdata/tui/compact.golden
+new file mode 100644
+index 0000000..93a5994
+--- /dev/null
++++ b/src/testdata/tui/compact.golden
+@@ -0,0 +1,17 @@
++ya-router control  CONNECTED  theme=mon…
++[1:Overview]  2:Providers  3:Accounts  …
++----------------------------------------
++Service
++Version: test-build
++Deployment: local
++Config revision: 12
++Restart required: false
++
++Summary
++Providers ready: 1/2
++Accounts: 1
++Models: 1
++Operations: 1
++Last refresh: 2026-07-16T01:02:03Z
++----------------------------------------
++Tab/←/→ switch  r reconnect/refresh  t …
+\ No newline at end of file
+diff --git a/src/testdata/tui/standard.golden b/src/testdata/tui/standard.golden
+new file mode 100644
+index 0000000..e7d2dbd
+--- /dev/null
++++ b/src/testdata/tui/standard.golden
+@@ -0,0 +1,17 @@
++ya-router control  CONNECTED  theme=monochrome
++[1:Overview]  2:Providers  3:Accounts  4:Models  5:Config  6:Operations  7:Even…
++--------------------------------------------------------------------------------
++Service
++Version: test-build
++Deployment: local
++Config revision: 12
++Restart required: false
++
++Summary
++Providers ready: 1/2
++Accounts: 1
++Models: 1
++Operations: 1
++Last refresh: 2026-07-16T01:02:03Z
++--------------------------------------------------------------------------------
++Tab/←/→ switch  r reconnect/refresh  t theme  q quit
+\ No newline at end of file
+diff --git a/src/testdata/tui/wide.golden b/src/testdata/tui/wide.golden
+new file mode 100644
+index 0000000..9cbbf4d
+--- /dev/null
++++ b/src/testdata/tui/wide.golden
+@@ -0,0 +1,17 @@
++ya-router control  CONNECTED  theme=monochrome
++[1:Overview]  2:Providers  3:Accounts  4:Models  5:Config  6:Operations  7:Events
++------------------------------------------------------------------------------------------------------------------------
++Service
++Version: test-build
++Deployment: local
++Config revision: 12
++Restart required: false
++
++Summary
++Providers ready: 1/2
++Accounts: 1
++Models: 1
++Operations: 1
++Last refresh: 2026-07-16T01:02:03Z
++------------------------------------------------------------------------------------------------------------------------
++Tab/←/→ switch  r reconnect/refresh  t theme  q quit
+\ No newline at end of file
+diff --git a/src/tui.go b/src/tui.go
+new file mode 100644
+index 0000000..6546da5
+--- /dev/null
++++ b/src/tui.go
+@@ -0,0 +1,451 @@
++package yarouter
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"sort"
++	"strings"
++	"time"
++
++	"github.com/charmbracelet/bubbles/spinner"
++	tea "github.com/charmbracelet/bubbletea"
++	"github.com/charmbracelet/lipgloss"
++
++	clientpkg "github.com/duvu/ya-router/internal/client"
++	controlpkg "github.com/duvu/ya-router/internal/control"
++	providerpkg "github.com/duvu/ya-router/internal/provider"
++)
++
++type tuiAPI interface {
++	Meta(context.Context) (controlpkg.MetaResponse, error)
++	Providers(context.Context) ([]controlpkg.ProviderResource, error)
++	Accounts(context.Context) ([]controlpkg.AccountResource, error)
++	Models(context.Context, bool) (controlpkg.ModelCatalogResponse, error)
++	Configuration(context.Context) (controlpkg.ConfigResource, error)
++	Operations(context.Context) ([]controlpkg.OperationResource, error)
++	Events(context.Context, uint64) (controlpkg.EventPage, error)
++}
++
++type tuiTheme int
++
++const (
++	themeAuto tuiTheme = iota
++	themeLight
++	themeDark
++	themeMonochrome
++)
++
++func (theme tuiTheme) String() string {
++	switch theme {
++	case themeLight:
++		return "light"
++	case themeDark:
++		return "dark"
++	case themeMonochrome:
++		return "monochrome"
++	default:
++		return "auto"
++	}
++}
++
++type tuiSnapshot struct {
++	meta          controlpkg.MetaResponse
++	providers     []controlpkg.ProviderResource
++	accounts      []controlpkg.AccountResource
++	models        controlpkg.ModelCatalogResponse
++	configuration controlpkg.ConfigResource
++	operations    []controlpkg.OperationResource
++	events        controlpkg.EventPage
++	loadedAt      time.Time
++}
++
++type tuiLoadedMsg struct{ snapshot tuiSnapshot }
++type tuiErrorMsg struct{ err error }
++type tuiTickMsg time.Time
++
++type tuiModel struct {
++	client  tuiAPI
++	spinner spinner.Model
++	width   int
++	height  int
++	tab     int
++	theme   tuiTheme
++	loading bool
++	offline bool
++	err     error
++	data    tuiSnapshot
++}
++
++var tuiTabs = []string{"Overview", "Providers", "Accounts", "Models", "Config", "Operations", "Events"}
++
++func newTUIModel(client tuiAPI) tuiModel {
++	return tuiModel{client: client, spinner: spinner.New(), width: 80, height: 24, loading: true}
++}
++
++func (model tuiModel) Init() tea.Cmd {
++	return tea.Batch(model.spinner.Tick, model.loadCmd(false), tuiTickCmd())
++}
++
++func (model tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
++	switch message := message.(type) {
++	case tea.WindowSizeMsg:
++		model.width = maxInt(32, message.Width)
++		model.height = maxInt(10, message.Height)
++		return model, nil
++	case tea.KeyMsg:
++		switch strings.ToLower(message.String()) {
++		case "q", "ctrl+c":
++			return model, tea.Quit
++		case "tab", "right", "l":
++			model.tab = (model.tab + 1) % len(tuiTabs)
++			return model, nil
++		case "shift+tab", "left", "h":
++			model.tab = (model.tab - 1 + len(tuiTabs)) % len(tuiTabs)
++			return model, nil
++		case "r":
++			model.loading = true
++			return model, model.loadCmd(true)
++		case "t":
++			model.theme = (model.theme + 1) % 4
++			return model, nil
++		case "1", "2", "3", "4", "5", "6", "7":
++			model.tab = int(message.String()[0] - '1')
++			return model, nil
++		}
++	case spinner.TickMsg:
++		var command tea.Cmd
++		model.spinner, command = model.spinner.Update(message)
++		return model, command
++	case tuiLoadedMsg:
++		model.data = message.snapshot
++		model.loading = false
++		model.offline = false
++		model.err = nil
++		return model, nil
++	case tuiErrorMsg:
++		model.loading = false
++		model.offline = true
++		model.err = sanitizeTUIError(message.err)
++		return model, nil
++	case tuiTickMsg:
++		return model, tea.Batch(tuiTickCmd(), model.loadCmd(false))
++	}
++	return model, nil
++}
++
++func (model tuiModel) View() string {
++	styles := tuiStylesFor(model.theme)
++	status := "CONNECTED"
++	if model.offline {
++		status = "OFFLINE"
++	} else if model.loading {
++		status = "REFRESHING"
++	}
++	header := styles.title.Render("ya-router control") + "  " + status + "  theme=" + model.theme.String()
++	if model.loading {
++		header += " " + model.spinner.View()
++	}
++	tabs := make([]string, 0, len(tuiTabs))
++	for index, tab := range tuiTabs {
++		label := fmt.Sprintf("%d:%s", index+1, tab)
++		if index == model.tab {
++			label = styles.active.Render("[" + label + "]")
++		}
++		tabs = append(tabs, label)
++	}
++	body := model.renderTab(styles)
++	if model.err != nil {
++		body = styles.error.Render("Error: "+model.err.Error()) + "\n\n" + body
++	}
++	footer := "Tab/←/→ switch  r reconnect/refresh  t theme  q quit"
++	return strings.Join([]string{
++		fitTUILine(header, model.width), fitTUILine(strings.Join(tabs, "  "), model.width),
++		strings.Repeat("-", minInt(model.width, 120)), body,
++		strings.Repeat("-", minInt(model.width, 120)), fitTUILine(footer, model.width),
++	}, "\n")
++}
++
++func (model tuiModel) renderTab(styles tuiStyles) string {
++	switch model.tab {
++	case 1:
++		return model.renderProviders(styles)
++	case 2:
++		return model.renderAccounts(styles)
++	case 3:
++		return model.renderModels(styles)
++	case 4:
++		return model.renderConfig(styles)
++	case 5:
++		return model.renderOperations(styles)
++	case 6:
++		return model.renderEvents(styles)
++	default:
++		return model.renderOverview(styles)
++	}
++}
++
++func (model tuiModel) renderOverview(styles tuiStyles) string {
++	ready := 0
++	for _, provider := range model.data.providers {
++		if provider.Enabled && provider.Health.State != providerpkg.StateError && provider.Health.State != providerpkg.StateDisabled {
++			ready++
++		}
++	}
++	modelCount := 0
++	for _, catalog := range model.data.models.Catalogs {
++		modelCount += len(catalog.Models)
++	}
++	loaded := "never"
++	if !model.data.loadedAt.IsZero() {
++		loaded = model.data.loadedAt.Format(time.RFC3339)
++	}
++	return strings.Join([]string{
++		styles.section.Render("Service"),
++		fmt.Sprintf("Version: %s", emptyFallback(model.data.meta.ServiceVersion, "unknown")),
++		fmt.Sprintf("Deployment: %s", emptyFallback(model.data.meta.DeploymentMode, "unknown")),
++		fmt.Sprintf("Config revision: %d", model.data.meta.ConfigRevision),
++		fmt.Sprintf("Restart required: %t", model.data.meta.RestartRequired), "",
++		styles.section.Render("Summary"),
++		fmt.Sprintf("Providers ready: %d/%d", ready, len(model.data.providers)),
++		fmt.Sprintf("Accounts: %d", len(model.data.accounts)),
++		fmt.Sprintf("Models: %d", modelCount),
++		fmt.Sprintf("Operations: %d", len(model.data.operations)),
++		fmt.Sprintf("Last refresh: %s", loaded),
++	}, "\n")
++}
++
++func (model tuiModel) renderProviders(styles tuiStyles) string {
++	lines := []string{styles.section.Render("Providers")}
++	for _, provider := range model.data.providers {
++		state := emptyFallback(string(provider.Health.State), "unknown")
++		lines = append(lines, fmt.Sprintf("[%s] %s (%s) generation=%d capabilities=%s", state, provider.Descriptor.Name, provider.Descriptor.ID, provider.Generation, joinCapabilities(provider.EffectiveCapabilities)))
++	}

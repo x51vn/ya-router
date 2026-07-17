@@ -13,9 +13,14 @@ import (
 	configschema "github.com/duvu/ya-router/internal/config"
 	providerpkg "github.com/duvu/ya-router/internal/provider"
 	runtimepkg "github.com/duvu/ya-router/internal/runtime"
+	secretpkg "github.com/duvu/ya-router/internal/secret"
 )
 
 func newProviderManager(config *Config, runtimeManager *runtimepkg.Manager) (*providerpkg.Manager, error) {
+	return newProviderManagerWithAuth(config, runtimeManager, nil)
+}
+
+func newProviderManagerWithAuth(config *Config, runtimeManager *runtimepkg.Manager, auth secretpkg.AuthController) (*providerpkg.Manager, error) {
 	health := providerpkg.NewHealthRegistry()
 	events := providerpkg.NewEventBus(256)
 	manager, err := providerpkg.NewManager(runtimeManager, health, events, providerpkg.ManagerOptions{
@@ -25,7 +30,7 @@ func newProviderManager(config *Config, runtimeManager *runtimepkg.Manager) (*pr
 	if err != nil {
 		return nil, err
 	}
-	for _, factory := range compiledProviderFactories() {
+	for _, factory := range compiledProviderFactoriesWithAuth(auth) {
 		if err := manager.RegisterFactory(factory); err != nil {
 			return nil, err
 		}
@@ -45,6 +50,10 @@ func providerDrainTimeout(config *Config) time.Duration {
 }
 
 func compiledProviderFactories() []providerpkg.Factory {
+	return compiledProviderFactoriesWithAuth(nil)
+}
+
+func compiledProviderFactoriesWithAuth(auth secretpkg.AuthController) []providerpkg.Factory {
 	return []providerpkg.Factory{
 		providerpkg.FactoryFuncs{
 			ProviderDescriptor: providerpkg.Descriptor{
@@ -65,7 +74,7 @@ func compiledProviderFactories() []providerpkg.Factory {
 			ValidateConfigFunc: validateRuntimeConfig,
 			BuildFunc: func(_ context.Context, value any) (Provider, error) {
 				config := configschema.Clone(value.(*Config))
-				return NewCopilotProvider(config), nil
+				return NewCopilotProviderWithAuth(config, auth), nil
 			},
 			ValidateFunc: validateBuiltProvider,
 		},
@@ -90,7 +99,7 @@ func compiledProviderFactories() []providerpkg.Factory {
 			ValidateConfigFunc: validateRuntimeConfig,
 			BuildFunc: func(_ context.Context, value any) (Provider, error) {
 				config := configschema.Clone(value.(*Config))
-				return NewCodexProvider(config), nil
+				return NewCodexProviderWithAuth(config, auth), nil
 			},
 			ValidateFunc: validateBuiltProvider,
 		},
@@ -113,7 +122,7 @@ func compiledProviderFactories() []providerpkg.Factory {
 			ValidateConfigFunc: validateRuntimeConfig,
 			BuildFunc: func(_ context.Context, value any) (Provider, error) {
 				config := configschema.Clone(value.(*Config))
-				registered := NewKiloProvider(config)
+				registered := NewKiloProviderWithAuth(config, auth)
 				if _, err := registered.baseURL(); err != nil {
 					return nil, err
 				}
@@ -232,6 +241,19 @@ func managedProxyHandler(manager *runtimepkg.Manager) http.HandlerFunc {
 	}
 }
 
+func managedAnthropicHandler(manager *runtimepkg.Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		lease, err := manager.Acquire()
+		if err != nil {
+			writeAnthropicError(w, http.StatusServiceUnavailable, err)
+			return
+		}
+		defer lease.Release()
+		snapshot := lease.Snapshot()
+		anthropicHandler(snapshot.Providers(), snapshot.Router(), snapshot.Config()).ServeHTTP(w, r)
+	}
+}
+
 func managedModelsHandler(manager *runtimepkg.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		lease, err := manager.Acquire()
@@ -245,7 +267,7 @@ func managedModelsHandler(manager *runtimepkg.Manager) http.HandlerFunc {
 	}
 }
 
-func managedHealthHandler(providerManager *providerpkg.Manager) http.HandlerFunc {
+func managedHealthHandler(providerManager *providerpkg.Manager, runtimeManager *runtimepkg.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimSuffix(r.URL.Path, "/")
 		if path == "/health" {
@@ -254,6 +276,10 @@ func managedHealthHandler(providerManager *providerpkg.Manager) http.HandlerFunc
 				"service":   "ya-router",
 				"timestamp": time.Now().Unix(),
 			})
+			return
+		}
+		if path == "/health/umbrella" {
+			writeManagedUmbrellaDiagnostics(w, runtimeManager)
 			return
 		}
 		providerManager.RefreshHealth(r.Context())
@@ -273,6 +299,25 @@ func managedHealthHandler(providerManager *providerpkg.Manager) http.HandlerFunc
 			writeJSON(w, http.StatusOK, map[string]interface{}{"status": "ok"})
 		}
 	}
+}
+
+// writeManagedUmbrellaDiagnostics reports redacted virtual-model readiness for
+// chat capability and bounded routing metrics. It performs no network I/O: the
+// readiness view is computed from the network-free availability snapshot.
+func writeManagedUmbrellaDiagnostics(w http.ResponseWriter, runtimeManager *runtimepkg.Manager) {
+	lease, err := runtimeManager.Acquire()
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{"status": "unavailable"})
+		return
+	}
+	defer lease.Release()
+	router := lease.Snapshot().Router()
+	snapshot := router.AvailabilitySnapshot()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":         "ok",
+		"virtual_models": router.VirtualModelReadinessFor(CapabilityChat, snapshot),
+		"metrics":        router.Metrics().Snapshot(),
+	})
 }
 
 func writeManagedReadiness(w http.ResponseWriter, statuses []providerpkg.ProviderStatus) {

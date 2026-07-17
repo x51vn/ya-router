@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	secretpkg "github.com/duvu/ya-router/internal/secret"
 )
 
 func newTestKiloProvider(t *testing.T, handler http.HandlerFunc) (*KiloProvider, *httptest.Server) {
@@ -105,6 +107,26 @@ func TestKiloAuthenticatedProxyUsesProviderCredentialAndPreservesStatus(t *testi
 	}
 	if !strings.Contains(response.Body.String(), "rate limited") {
 		t.Errorf("body = %q", response.Body.String())
+	}
+}
+
+func TestKiloUsesManagedCredentialResolver(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Providers.Kilo.APIKey = "legacy-key"
+	store := secretpkg.NewMemoryStore(nil)
+	if _, err := store.Set("operator", "kilo/api_key", "managed-key"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Set("operator", "kilo/organization_id", "managed-organization"); err != nil {
+		t.Fatal(err)
+	}
+	provider := NewKiloProviderWithAuth(cfg, secretpkg.NewStoreController(store, nil))
+	key, source := provider.apiKey()
+	if key != "managed-key" || source != "managed" {
+		t.Fatalf("credential = %q from %q", key, source)
+	}
+	if organizationID := provider.organizationID(); organizationID != "managed-organization" {
+		t.Fatalf("organization id = %q", organizationID)
 	}
 }
 

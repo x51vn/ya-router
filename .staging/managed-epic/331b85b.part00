@@ -1,0 +1,295 @@
+From 331b85b82bd83cf52d260ea40ad9aa776813b82f Mon Sep 17 00:00:00 2001
+From: OpenAI Agent <agent@openai.local>
+Date: Thu, 16 Jul 2026 00:20:26 +0000
+Subject: [PATCH] feat(auth): add provider auth adapters and SecretStore
+
+---
+ docs/CONTROL_API.md                           |  16 +
+ docs/qa/ya-tui-07.md                          |   8 +
+ internal/control/operation_resources.go       | 119 +++-
+ internal/control/secrets.go                   |  45 ++
+ internal/operation/manager.go                 |   9 +-
+ internal/secret/store.go                      | 305 +++++++++++
+ internal/secret/store_test.go                 |  62 +++
+ .../add-managed-service-and-tui/tasks.md      |   2 +-
+ src/auth.go                                   | 166 +++---
+ src/auth_controller.go                        | 513 ++++++++++++++++++
+ src/auth_controller_test.go                   | 145 +++++
+ src/cli.go                                    |  18 +-
+ src/codex_auth.go                             | 120 ++--
+ src/config_persistence.go                     | 143 ++++-
+ src/control_runtime.go                        |  23 +-
+ src/secret_runtime.go                         | 244 +++++++++
+ src/secret_runtime_test.go                    |  33 ++
+ 17 files changed, 1845 insertions(+), 126 deletions(-)
+ create mode 100644 docs/qa/ya-tui-07.md
+ create mode 100644 internal/control/secrets.go
+ create mode 100644 internal/secret/store.go
+ create mode 100644 internal/secret/store_test.go
+ create mode 100644 src/auth_controller.go
+ create mode 100644 src/auth_controller_test.go
+ create mode 100644 src/secret_runtime.go
+ create mode 100644 src/secret_runtime_test.go
+
+diff --git a/docs/CONTROL_API.md b/docs/CONTROL_API.md
+index 7bd4fb6..d5f7c8c 100644
+--- a/docs/CONTROL_API.md
++++ b/docs/CONTROL_API.md
+@@ -194,3 +194,19 @@ The auth-session creation contract accepts only provider, daemon-owned account
+ ID, method, and expiry. API keys, recovery tokens, device codes, and other secret
+ fields are rejected here; provider adapters and write-only secret handling are
+ implemented by the next authentication milestone.
++
++## Managed authentication and SecretStore
++
++Provider authentication is daemon-owned. Copilot and Codex device-code flows,
++Codex API-key/recovery-token modes, Kilo anonymous/API-key mode, multi-account
++state, reconnect, and cancellation are exposed through auth sessions.
++
++Raw credentials are write-only. Service-owned credentials are encrypted with
++AES-GCM in `secrets.json`; configuration stores only secret references. The
++master key is supplied through `YA_ROUTER_SECRET_STORE_KEY` or a private key
++file. Environment credentials remain higher precedence and read-only, so a TUI
++write cannot silently shadow them. The official Codex credential store remains
++read-only import data.
++
++`POST /control/v1/secrets:rotate` rotates the local encrypted store. Rotation is
++rejected when the master key is environment-owned.
+diff --git a/docs/qa/ya-tui-07.md b/docs/qa/ya-tui-07.md
+new file mode 100644
+index 0000000..386a5df
+--- /dev/null
++++ b/docs/qa/ya-tui-07.md
+@@ -0,0 +1,8 @@
++# YA-TUI-07 acceptance evidence
++
++- Auth-session responses contain only operation metadata, verification URI, and user code; stored secrets are never returned.
++- Copilot device-code and multi-account, Codex device/API-key/recovery and multi-account, and Kilo anonymous/API-key adapters are daemon-owned.
++- Environment credentials are represented as read-only references and cannot be shadowed by a lower-precedence Control API write.
++- Official Codex credential storage remains read-only.
++- Encrypted FileStore persistence and atomic key rotation are covered by unit and fault tests.
++- Real-provider checks remain manual and redacted; no provider secret is emitted to CI artifacts.
+diff --git a/internal/control/operation_resources.go b/internal/control/operation_resources.go
+index 18f9e4a..717c3ad 100644
+--- a/internal/control/operation_resources.go
++++ b/internal/control/operation_resources.go
+@@ -30,6 +30,39 @@ type OperationManager interface {
+ 	Subscribe(int) (<-chan operationpkg.Event, func())
+ }
+ 
++// AuthSessionStart is the write-only daemon contract for provider-managed
++// authentication. Secret bytes must never be retained in operation metadata.
++type AuthSessionStart struct {
++	Provider       string
++	Account        string
++	Mode           string
++	Owner          string
++	IdempotencyKey string
++	RequestDigest  string
++	ExpiresAt      time.Time
++	Secret         []byte
++}
++
++// AuthSessionView is safe for clients. It contains operation state and, for a
++// live device flow, the short-lived verification challenge but no credential.
++type AuthSessionView struct {
++	Operation       operationpkg.Record `json:"operation"`
++	Provider        string              `json:"provider"`
++	Account         string              `json:"account,omitempty"`
++	Mode            string              `json:"mode"`
++	VerificationURI string              `json:"verification_uri,omitempty"`
++	UserCode        string              `json:"user_code,omitempty"`
++}
++
++type AuthSessionBackend interface {
++	StartAuthSession(context.Context, AuthSessionStart) (AuthSessionView, bool, error)
++	AuthSession(context.Context, string, string, bool) (AuthSessionView, error)
++}
++
++type AuthSessionCanceller interface {
++	CancelAuthSession(context.Context, string, string, bool) (AuthSessionView, error)
++}
++
+ type operationCreateRequest struct {
+ 	Kind             string                      `json:"kind"`
+ 	Target           string                      `json:"target,omitempty"`
+@@ -42,6 +75,8 @@ type authSessionCreateRequest struct {
+ 	ProviderID       providerpkg.ID `json:"provider_id"`
+ 	AccountID        string         `json:"account_id,omitempty"`
+ 	Method           string         `json:"method"`
++	APIKey           string         `json:"api_key,omitempty"`
++	RecoveryToken    string         `json:"recovery_token,omitempty"`
+ 	ExpiresInSeconds int            `json:"expires_in_seconds,omitempty"`
+ }
+ 
+@@ -76,7 +111,11 @@ var allowedAuthMethods = map[providerpkg.ID]map[string]struct{}{
+ // RegisterOperationRoutes adds persistent operation and provider-neutral auth
+ // session resources. Provider-specific authentication execution is deliberately
+ // deferred to YA-TUI-07; these resources own durable lifecycle and reconnect.
+-func RegisterOperationRoutes(api *API, manager OperationManager) {
++func RegisterOperationRoutes(api *API, manager OperationManager, authBackends ...AuthSessionBackend) {
++	var authBackend AuthSessionBackend
++	if len(authBackends) > 0 {
++		authBackend = authBackends[0]
++	}
+ 	api.Handle(http.MethodPost, "/control/v1/operations", RoleOperator, false, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+ 		createOperation(writer, request, manager)
+ 	}))
+@@ -87,20 +126,20 @@ func RegisterOperationRoutes(api *API, manager OperationManager) {
+ 		serveOperationEvents(writer, request, manager, true)
+ 	}))
+ 	api.HandlePrefix(http.MethodGet, "/control/v1/operations/", RoleViewer, false, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+-		getOperation(writer, request, manager, "/control/v1/operations/", false)
++		getOperation(writer, request, manager, "/control/v1/operations/", false, nil)
+ 	}))
+ 	api.HandlePrefix(http.MethodDelete, "/control/v1/operations/", RoleOperator, false, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+-		cancelOperation(writer, request, manager, "/control/v1/operations/", false)
++		cancelOperation(writer, request, manager, "/control/v1/operations/", false, nil)
+ 	}))
+ 
+ 	api.Handle(http.MethodPost, "/control/v1/auth-sessions", RoleOperator, false, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+-		createAuthSession(writer, request, manager)
++		createAuthSession(writer, request, manager, authBackend)
+ 	}))
+ 	api.HandlePrefix(http.MethodGet, "/control/v1/auth-sessions/", RoleViewer, false, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+-		getOperation(writer, request, manager, "/control/v1/auth-sessions/", true)
++		getOperation(writer, request, manager, "/control/v1/auth-sessions/", true, authBackend)
+ 	}))
+ 	api.HandlePrefix(http.MethodDelete, "/control/v1/auth-sessions/", RoleOperator, false, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+-		cancelOperation(writer, request, manager, "/control/v1/auth-sessions/", true)
++		cancelOperation(writer, request, manager, "/control/v1/auth-sessions/", true, authBackend)
+ 	}))
+ }
+ 
+@@ -161,7 +200,7 @@ func createOperation(writer http.ResponseWriter, request *http.Request, manager
+ 	writeJSON(writer, status, record)
+ }
+ 
+-func createAuthSession(writer http.ResponseWriter, request *http.Request, manager OperationManager) {
++func createAuthSession(writer http.ResponseWriter, request *http.Request, manager OperationManager, authBackend AuthSessionBackend) {
+ 	if manager == nil {
+ 		writeError(writer, request, http.StatusServiceUnavailable, "operation_manager_unavailable", "The operation manager is unavailable.", true, nil)
+ 		return
+@@ -173,6 +212,10 @@ func createAuthSession(writer http.ResponseWriter, request *http.Request, manage
+ 	}
+ 	input.AccountID = strings.TrimSpace(input.AccountID)
+ 	input.Method = strings.TrimSpace(input.Method)
++	if authBackend == nil && (input.APIKey != "" || input.RecoveryToken != "") {
++		writeError(writer, request, http.StatusBadRequest, "invalid_auth_session_request", "Secret input requires the managed authentication backend.", false, nil)
++		return
++	}
+ 	methods, providerKnown := allowedAuthMethods[input.ProviderID]
+ 	_, methodAllowed := methods[input.Method]
+ 	if !providerKnown || !methodAllowed {
+@@ -195,6 +238,39 @@ func createAuthSession(writer http.ResponseWriter, request *http.Request, manage
+ 		target += "/" + input.AccountID
+ 	}
+ 	canonical, _ := json.Marshal(input)
++	if authBackend != nil {
++		mode := input.Method
++		secretText := input.APIKey
++		if mode == "manual_token_recovery" {
++			mode = "recovery_token"
++			secretText = input.RecoveryToken
++		}
++		if mode == "api_key" && strings.TrimSpace(input.APIKey) == "" {
++			writeError(writer, request, http.StatusBadRequest, "credential_required", "An API key is required.", false, nil)
++			return
++		}
++		if mode == "recovery_token" && strings.TrimSpace(input.RecoveryToken) == "" {
++			writeError(writer, request, http.StatusBadRequest, "credential_required", "A recovery token is required.", false, nil)
++			return
++		}
++		secret := []byte(secretText)
++		defer zeroBytes(secret)
++		view, created, startErr := authBackend.StartAuthSession(request.Context(), AuthSessionStart{
++			Provider: string(input.ProviderID), Account: input.AccountID, Mode: mode,
++			Owner: identity.Subject, IdempotencyKey: key, RequestDigest: digestPayload(canonical),
++			ExpiresAt: expiresAt, Secret: secret,
++		})
++		if startErr != nil {
++			writeOperationError(writer, request, startErr)
++			return
++		}
++		status := http.StatusOK
++		if created {
++			status = http.StatusAccepted
++		}
++		writeJSON(writer, status, view)
++		return
++	}
+ 	record, created, err := manager.Create(operationpkg.CreateRequest{
+ 		Kind:           "auth_session",
+ 		Target:         target,
+@@ -221,12 +297,22 @@ func createAuthSession(writer http.ResponseWriter, request *http.Request, manage
+ 	writeJSON(writer, status, record)
+ }
+ 
+-func getOperation(writer http.ResponseWriter, request *http.Request, manager OperationManager, prefix string, requireAuthSession bool) {
++func getOperation(writer http.ResponseWriter, request *http.Request, manager OperationManager, prefix string, requireAuthSession bool, authBackend AuthSessionBackend) {
+ 	id, ok := resourceID(request.URL.Path, prefix)
+ 	if !ok {
+ 		writeError(writer, request, http.StatusNotFound, "operation_not_found", "The operation was not found.", false, nil)
+ 		return
+ 	}
++	identity, _ := IdentityFromContext(request.Context())
++	if requireAuthSession && authBackend != nil {
++		view, err := authBackend.AuthSession(request.Context(), id, identity.Subject, identity.Role == RoleAdmin)
++		if err != nil {
++			writeOperationError(writer, request, err)
++			return
++		}
++		writeJSON(writer, http.StatusOK, view)
++		return
++	}
+ 	record, err := manager.Get(id)
+ 	if err != nil {
+ 		writeOperationError(writer, request, err)
+@@ -243,12 +329,27 @@ func getOperation(writer http.ResponseWriter, request *http.Request, manager Ope
+ 	writeJSON(writer, http.StatusOK, record)
+ }
+ 
+-func cancelOperation(writer http.ResponseWriter, request *http.Request, manager OperationManager, prefix string, requireAuthSession bool) {
++func cancelOperation(writer http.ResponseWriter, request *http.Request, manager OperationManager, prefix string, requireAuthSession bool, authBackend AuthSessionBackend) {
+ 	id, ok := resourceID(request.URL.Path, prefix)
+ 	if !ok {
+ 		writeError(writer, request, http.StatusNotFound, "operation_not_found", "The operation was not found.", false, nil)
+ 		return
+ 	}
++	identity, _ := IdentityFromContext(request.Context())
++	if requireAuthSession && authBackend != nil {
++		canceller, ok := authBackend.(AuthSessionCanceller)
++		if !ok {
++			writeError(writer, request, http.StatusConflict, "operation_not_cancelable", "The auth session is not cancelable.", false, nil)
++			return
++		}
++		view, err := canceller.CancelAuthSession(request.Context(), id, identity.Subject, identity.Role == RoleAdmin)
++		if err != nil {
++			writeOperationError(writer, request, err)
++			return
++		}
++		writeJSON(writer, http.StatusOK, view)
++		return
++	}
+ 	record, err := manager.Get(id)
+ 	if err != nil {
+ 		writeOperationError(writer, request, err)
+diff --git a/internal/control/secrets.go b/internal/control/secrets.go
+new file mode 100644
+index 0000000..ab2fbcd
+--- /dev/null
++++ b/internal/control/secrets.go
+@@ -0,0 +1,45 @@
++package control
++
++import (
++	"context"
++	"encoding/json"
++	"io"
++	"net/http"
++)
++
++type SecretKeyRotator interface {
++	RotateSecretKey(context.Context, []byte) error
++}
++

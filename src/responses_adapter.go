@@ -348,6 +348,19 @@ func buildChatGPTNativeResponsesRequest(body []byte) ([]byte, bool, error) {
 		}
 		out[key] = value
 	}
+	if input, ok := out["input"]; ok {
+		var text string
+		if json.Unmarshal(input, &text) == nil {
+			normalized, err := json.Marshal([]struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			}{{Role: "user", Content: text}})
+			if err != nil {
+				return nil, false, fmt.Errorf("encode ChatGPT Responses input: %w", err)
+			}
+			out["input"] = normalized
+		}
+	}
 	out["stream"], _ = json.Marshal(true)
 	out["store"], _ = json.Marshal(false)
 	encoded, err := json.Marshal(out)
@@ -664,6 +677,7 @@ func aggregateSSEToCompletion(reader io.Reader) ([]byte, error) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	eventType := ""
+	var textDeltas strings.Builder
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "event: ") {
@@ -675,6 +689,17 @@ func aggregateSSEToCompletion(reader io.Reader) ([]byte, error) {
 		}
 		data := strings.TrimPrefix(line, "data: ")
 		switch eventType {
+		case "response.output_text.delta":
+			// Some upstreams (notably the ChatGPT Codex transport) stream the
+			// assistant text only through delta events and emit a terminal
+			// response.completed whose "output" array is empty. Accumulate the
+			// deltas so a non-streaming client still receives the full text.
+			var event struct {
+				Delta string `json:"delta"`
+			}
+			if err := json.Unmarshal([]byte(data), &event); err == nil {
+				textDeltas.WriteString(event.Delta)
+			}
 		case "response.completed":
 			var event struct {
 				Response json.RawMessage `json:"response"`
@@ -682,7 +707,7 @@ func aggregateSSEToCompletion(reader io.Reader) ([]byte, error) {
 			if err := json.Unmarshal([]byte(data), &event); err != nil {
 				return nil, fmt.Errorf("parse response.completed: %w", err)
 			}
-			return event.Response, nil
+			return mergeAccumulatedText(event.Response, textDeltas.String())
 		case "response.failed", "response.incomplete", "error":
 			return nil, fmt.Errorf("upstream SSE failure: %s", eventType)
 		}
@@ -691,6 +716,43 @@ func aggregateSSEToCompletion(reader io.Reader) ([]byte, error) {
 		return nil, fmt.Errorf("reading Responses SSE: %w", err)
 	}
 	return nil, fmt.Errorf("no response.completed event in SSE stream")
+}
+
+// mergeAccumulatedText injects streamed text-delta output into a terminal
+// response body whose "output" array came back empty. When the response
+// already carries output items, it is returned unchanged.
+func mergeAccumulatedText(responseJSON []byte, text string) ([]byte, error) {
+	if text == "" {
+		return responseJSON, nil
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(responseJSON, &envelope); err != nil {
+		return responseJSON, nil
+	}
+	if raw, ok := envelope["output"]; ok {
+		var existing []json.RawMessage
+		if err := json.Unmarshal(raw, &existing); err == nil && len(existing) > 0 {
+			return responseJSON, nil
+		}
+	}
+	synthesized := []map[string]interface{}{{
+		"type": "message",
+		"role": "assistant",
+		"content": []map[string]interface{}{{
+			"type": "output_text",
+			"text": text,
+		}},
+	}}
+	encoded, err := json.Marshal(synthesized)
+	if err != nil {
+		return responseJSON, nil
+	}
+	envelope["output"] = encoded
+	merged, err := json.Marshal(envelope)
+	if err != nil {
+		return responseJSON, nil
+	}
+	return merged, nil
 }
 
 func classifyUpstreamStatus(status int) ProviderErrorKind {

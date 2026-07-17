@@ -11,6 +11,7 @@ import (
 	"time"
 
 	runtimepkg "github.com/duvu/ya-router/internal/runtime"
+	secretpkg "github.com/duvu/ya-router/internal/secret"
 )
 
 func printUsage() {
@@ -430,6 +431,8 @@ func handleRunWithMigration(migrationMode ConfigMigrationMode) error {
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
+	closeLog := setupLogging(cfg.Logging)
+	defer closeLog()
 	initializeTimeouts(cfg)
 	if cfg.Providers.Codex.Enabled && ensureCodexModelMap(cfg) {
 		if err := saveConfig(cfg); err != nil {
@@ -441,7 +444,14 @@ func handleRunWithMigration(migrationMode ConfigMigrationMode) error {
 	if err != nil {
 		return fmt.Errorf("create runtime manager: %w", err)
 	}
-	providerManager, err := newProviderManager(cfg, runtimeManager)
+	secretStore, err := newDaemonSecretStore(cfg, nil)
+	if err != nil {
+		shutdownContext, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = runtimeManager.Close(shutdownContext)
+		return fmt.Errorf("open daemon secret store: %w", err)
+	}
+	providerManager, err := newProviderManagerWithAuth(cfg, runtimeManager, secretpkg.NewStoreController(secretStore, nil))
 	if err != nil {
 		shutdownContext, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
@@ -461,8 +471,6 @@ func handleRunWithMigration(migrationMode ConfigMigrationMode) error {
 		_, _ = providerManager.Reconcile(shutdownContext, nil)
 		_ = runtimeManager.Close(shutdownContext)
 	}()
-	setupLogging()
-
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/models", managedModelsHandler(runtimeManager))
 	mux.HandleFunc("/v1/models/", managedModelsHandler(runtimeManager))
@@ -472,8 +480,17 @@ func handleRunWithMigration(migrationMode ConfigMigrationMode) error {
 	mux.HandleFunc("/v1/chat/completions/", managedProxyHandler(runtimeManager))
 	mux.HandleFunc("/v1/responses", managedProxyHandler(runtimeManager))
 	mux.HandleFunc("/v1/responses/", managedProxyHandler(runtimeManager))
-	mux.HandleFunc("/health", managedHealthHandler(providerManager))
-	mux.HandleFunc("/health/", managedHealthHandler(providerManager))
+	mux.HandleFunc("/v1/messages", managedAnthropicHandler(runtimeManager))
+	mux.HandleFunc("/v1/messages/", managedAnthropicHandler(runtimeManager))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.NotFound(w, r)
+	})
+	mux.HandleFunc("/health", managedHealthHandler(providerManager, runtimeManager))
+	mux.HandleFunc("/health/", managedHealthHandler(providerManager, runtimeManager))
 	if cfg.EnablePprof {
 		mux.HandleFunc("/debug/pprof/", http.DefaultServeMux.ServeHTTP)
 		mux.HandleFunc("/debug/pprof/cmdline", http.DefaultServeMux.ServeHTTP)
@@ -497,19 +514,24 @@ func handleRunWithMigration(migrationMode ConfigMigrationMode) error {
 		WriteTimeout: time.Duration(cfg.Timeouts.ServerWrite) * time.Second,
 		IdleTimeout:  time.Duration(cfg.Timeouts.ServerIdle) * time.Second,
 	}
-	setupGracefulShutdown(server)
+	controlRuntime, err := newManagedControlRuntimeWithSecretStore(cfg, runtimeManager, providerManager, secretStore)
+	if err != nil {
+		return fmt.Errorf("configure control service: %w", err)
+	}
 	fmt.Printf("Starting proxy on %s\n", address)
 	fmt.Println("  /v1/models              → aggregated from all providers")
 	fmt.Println("  /v1/chat/completions    → Chat Completions compatibility")
 	fmt.Println("  /v1/responses           → native Responses API")
+	fmt.Println("  /v1/messages            → Anthropic Messages compatibility")
 	fmt.Println("  /v1/embeddings          → API-key-capable providers only")
+	fmt.Printf("Starting local control API on unix://%s\n", controlRuntime.unixSocket)
+	if controlRuntime.remoteAddress != "" {
+		fmt.Printf("Starting remote control API on https://%s\n", controlRuntime.remoteAddress)
+	}
 	if cfg.EnablePprof {
 		fmt.Println("  /debug/pprof/           → enabled and access-controlled")
 	}
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		return fmt.Errorf("server: %w", err)
-	}
-	return nil
+	return serveManagedServers(server, controlRuntime)
 }
 
 func handleModels(providerFilter string, forceRefresh bool) error {

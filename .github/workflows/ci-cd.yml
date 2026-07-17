@@ -137,3 +137,28 @@ jobs:
             docker compose pull github-copilot-svcs
             docker compose up -d github-copilot-svcs
           '
+
+  package-linux:
+    name: Package Linux MVP artifacts
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+          cache: false
+
+      - name: Build verified Linux artifacts
+        run: VERSION="${{ github.sha }}" SOURCE_COMMIT="${{ github.sha }}" make release-linux
+
+      - name: Publish Linux artifacts with checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: ya-router-linux-amd64
+          path: dist/linux-amd64
+          if-no-files-found: error

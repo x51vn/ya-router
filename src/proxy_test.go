@@ -229,6 +229,7 @@ func TestModelsHandler_WithMockProvider(t *testing.T) {
 	})
 
 	cfg := defaultConfig()
+	cfg.Routing.VirtualModels = map[string]VirtualModelConfig{}
 	handler := modelsHandler(registry, cfg)
 
 	rr := httptest.NewRecorder()
@@ -272,6 +273,7 @@ func TestModelsHandler_MultipleProviders(t *testing.T) {
 	})
 
 	cfg := defaultConfig()
+	cfg.Routing.VirtualModels = map[string]VirtualModelConfig{}
 	handler := modelsHandler(registry, cfg)
 
 	rr := httptest.NewRecorder()
@@ -311,6 +313,7 @@ func TestModelsHandler_UnauthenticatedProviderSkipped(t *testing.T) {
 	})
 
 	cfg := defaultConfig()
+	cfg.Routing.VirtualModels = map[string]VirtualModelConfig{}
 	cfg.Routing.ShowUnavailableModels = false
 
 	handler := modelsHandler(registry, cfg)
@@ -342,6 +345,7 @@ func TestModelsHandler_ShowUnavailableModels(t *testing.T) {
 	})
 
 	cfg := defaultConfig()
+	cfg.Routing.VirtualModels = map[string]VirtualModelConfig{}
 	cfg.Routing.ShowUnavailableModels = true
 
 	handler := modelsHandler(registry, cfg)

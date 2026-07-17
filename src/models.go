@@ -150,6 +150,26 @@ func modelsHandler(registry *ProviderRegistry, cfg *Config) http.HandlerFunc {
 			}
 		}
 
+		// 3. Expose each configured umbrella (virtual) model once, owned by
+		//    ya-router. The catalog does not claim it is a specific upstream
+		//    model; the router selects a concrete target per request.
+		for modelID := range cfg.Routing.VirtualModels {
+			if !seen[modelID] {
+				seen[modelID] = true
+				allModels = append(allModels, Model{
+					ID:      modelID,
+					Object:  "model",
+					Created: time.Now().Unix(),
+					OwnedBy: "ya-router",
+				})
+			}
+		}
+
+		for _, alias := range discoverClaudeAliases(registry, cfg.Routing.ClaudeAliases, seen) {
+			seen[alias.ID] = true
+			allModels = append(allModels, alias)
+		}
+
 		resp := &ModelList{Object: "list", Data: allModels}
 		if allModels == nil {
 			resp.Data = []Model{}
@@ -161,4 +181,37 @@ func modelsHandler(registry *ProviderRegistry, cfg *Config) http.HandlerFunc {
 			log.Printf("modelsHandler: encode error: %v", err)
 		}
 	}
+}
+
+func discoverClaudeAliases(registry *ProviderRegistry, aliases map[string]string, known map[string]bool) []Model {
+	models := make([]Model, 0, len(aliases))
+	for alias, target := range aliases {
+		if known[alias] || !known[target] || !isClaudeDiscoveryID(alias) {
+			continue
+		}
+		_, providerID, prefixed := StripModelPrefix(target)
+		if !prefixed {
+			continue
+		}
+		provider, err := registry.Get(providerID)
+		if err != nil || !providerSupportsResponses(provider) {
+			continue
+		}
+		models = append(models, Model{ID: alias, Object: "model", Created: time.Now().Unix(), OwnedBy: "ya-router"})
+	}
+	return models
+}
+
+func isClaudeDiscoveryID(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(model, "claude") || strings.HasPrefix(model, "anthropic")
+}
+
+func providerSupportsResponses(provider Provider) bool {
+	for _, capability := range provider.Capabilities() {
+		if capability == CapabilityResponses {
+			return true
+		}
+	}
+	return false
 }

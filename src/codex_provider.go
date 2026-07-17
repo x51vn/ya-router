@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	secretpkg "github.com/duvu/ya-router/internal/secret"
 )
 
 const (
@@ -23,6 +25,7 @@ const (
 // CodexProvider implements Provider for ChatGPT-backed Codex and Platform API mode.
 type CodexProvider struct {
 	cfg           *Config
+	auth          secretpkg.AuthController
 	mu            sync.Mutex
 	cb            *CircuitBreaker
 	cache         *ModelCache
@@ -46,19 +49,6 @@ func setPlatformHeaders(req *http.Request, token string) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("User-Agent", codexUserAgent)
-}
-
-func NewCodexProvider(cfg *Config) *CodexProvider {
-	p := &CodexProvider{
-		cfg: cfg,
-		cb: &CircuitBreaker{
-			state:   CircuitClosed,
-			timeout: time.Duration(cfg.Timeouts.CircuitBreaker) * time.Second,
-		},
-		cache: NewModelCache(defaultModelCacheTTL),
-	}
-	p.accountCursor = p.firstHealthyCodexAccount()
-	return p
 }
 
 func (p *CodexProvider) ID() ProviderID { return ProviderCodex }
@@ -189,12 +179,22 @@ func (p *CodexProvider) credentialAtLocked(index int) codexCredential {
 		auth = &p.cfg.Providers.Codex.Accounts[index].Auth
 	}
 	if isAPIKeyMode(auth.Mode) {
+		if p.auth != nil {
+			if credential, ok := p.auth.ResolveCredential("codex/api_key"); ok {
+				return codexCredential{index: index, token: credential.Value}
+			}
+		}
 		key, _, err := resolveCodexAPIKey(auth)
 		if err != nil {
 			log.Printf("[codex] API-key resolution failed: %v", err)
 			return codexCredential{index: index}
 		}
 		return codexCredential{index: index, token: key}
+	}
+	if p.auth != nil {
+		if credential, ok := p.auth.ResolveCredential("codex/access_token"); ok {
+			return codexCredential{index: index, token: credential.Value, accountID: auth.AccountID, chatgpt: true}
+		}
 	}
 	return codexCredential{index: index, token: auth.AccessToken, accountID: auth.AccountID, chatgpt: true}
 }
@@ -258,11 +258,19 @@ func (p *CodexProvider) EnsureAuthenticated(_ context.Context) error {
 	auth := p.authState()
 
 	if isAPIKeyMode(auth.Mode) {
-		key, _, err := resolveCodexAPIKey(auth)
-		if err == nil && key != "" {
+		if credential := p.credentialAtLocked(p.accountCursor); credential.token != "" {
 			return nil
 		}
 		return newProviderError(ProviderCodex, ProviderErrorAuthRequired, http.StatusUnauthorized, false, "no Codex API key configured")
+	}
+	if p.auth != nil {
+		if credential, ok := p.auth.ResolveCredential("codex/access_token"); ok {
+			expiresAt := extractJWTExpiry(credential.Value)
+			if expiresAt > 0 && expiresAt-time.Now().Unix() <= 300 {
+				return newProviderError(ProviderCodex, ProviderErrorAuthRequired, http.StatusUnauthorized, false, "Codex authentication requires reconnection")
+			}
+			return nil
+		}
 	}
 
 	if auth.AccessToken == "" {

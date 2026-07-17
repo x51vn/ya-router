@@ -1,0 +1,307 @@
+From ba6715422932ba5cd3622d74251d9a9a416576dd Mon Sep 17 00:00:00 2001
+From: OpenAI Agent <agent@openai.local>
+Date: Thu, 16 Jul 2026 00:21:36 +0000
+Subject: [PATCH] feat(management): add revision-safe mutations and hot reload
+
+---
+ docs/CONTROL_API.md                           |  22 +
+ docs/qa/ya-tui-08.md                          |   7 +
+ internal/config/types.go                      |   2 +
+ internal/control/mutations.go                 | 241 +++++++++
+ .../add-managed-service-and-tui/tasks.md      |   2 +-
+ src/control_runtime.go                        |   3 +
+ src/managed_runtime.go                        |   4 +-
+ src/mutation_controller.go                    | 475 ++++++++++++++++++
+ src/mutation_controller_test.go               | 122 +++++
+ 9 files changed, 875 insertions(+), 3 deletions(-)
+ create mode 100644 docs/qa/ya-tui-08.md
+ create mode 100644 internal/control/mutations.go
+ create mode 100644 src/mutation_controller.go
+ create mode 100644 src/mutation_controller_test.go
+
+diff --git a/docs/CONTROL_API.md b/docs/CONTROL_API.md
+index d5f7c8c..28b3e19 100644
+--- a/docs/CONTROL_API.md
++++ b/docs/CONTROL_API.md
+@@ -210,3 +210,25 @@ read-only import data.
+ 
+ `POST /control/v1/secrets:rotate` rotates the local encrypted store. Rotation is
+ rejected when the master key is environment-owned.
++
++## Revision-safe management and hot reload
++
++All configuration mutations require an expected revision and an
++`Idempotency-Key`. The daemon validates a candidate before provider construction,
++publishes only a fully built runtime, persists the new revision, and restores the
++prior runtime if persistence fails.
++
++| Endpoint | Purpose |
++|---|---|
++| `POST /control/v1/config:validate` | Preview changed and restart-required paths |
++| `PATCH /control/v1/config` | Apply a complete desired configuration |
++| `POST /control/v1/config:rollback` | Restore last-known-good configuration |
++| `PATCH /control/v1/providers/{provider}` | Enable/disable and edit allowed models |
++| `PATCH /control/v1/providers/{provider}/accounts/{account}` | Enable, label, or reprioritize an account |
++| `DELETE /control/v1/providers/{provider}/accounts/{account}` | Remove an account and its daemon-owned secrets |
++| `PATCH /control/v1/routing` | Update default route and explicit model map |
++
++Stale writers receive `409`. Anonymous Kilo remains free-only, provider-prefixed
++routing remains isolated, and no mutation invokes systemd, Docker, a shell, or
++process self-restart. Port/listener changes are stored as desired state and
++reported as restart-required rather than applied unsafely in-process.
+diff --git a/docs/qa/ya-tui-08.md b/docs/qa/ya-tui-08.md
+new file mode 100644
+index 0000000..433182e
+--- /dev/null
++++ b/docs/qa/ya-tui-08.md
+@@ -0,0 +1,7 @@
++# YA-TUI-08 acceptance evidence
++
++- Stale expected revisions fail deterministically and cannot overwrite a newer writer.
++- Validation, provider construction, runtime publication, persistence, and rollback form one bounded transaction.
++- Failed provider construction or rejected apply leaves desired/effective state and data-plane snapshot unchanged.
++- Kilo anonymous paid-model restrictions and provider-prefix isolation remain validated.
++- Port/listener changes are restart-required; no code path invokes systemd, Docker, a shell, or self-restart.
+diff --git a/internal/config/types.go b/internal/config/types.go
+index d64d266..dfcee32 100644
+--- a/internal/config/types.go
++++ b/internal/config/types.go
+@@ -40,6 +40,7 @@ type CopilotAuthState struct {
+ type CopilotAccount struct {
+ 	ID            string           `json:"id,omitempty"`
+ 	Label         string           `json:"label"`
++	Disabled      bool             `json:"disabled,omitempty"`
+ 	Auth          CopilotAuthState `json:"auth"`
+ 	LastLimitedAt int64            `json:"last_limited_at,omitempty"`
+ }
+@@ -70,6 +71,7 @@ type CodexAuthState struct {
+ type CodexAccount struct {
+ 	ID            string         `json:"id,omitempty"`
+ 	Label         string         `json:"label"`
++	Disabled      bool           `json:"disabled,omitempty"`
+ 	Auth          CodexAuthState `json:"auth"`
+ 	LastLimitedAt int64          `json:"last_limited_at,omitempty"`
+ }
+diff --git a/internal/control/mutations.go b/internal/control/mutations.go
+new file mode 100644
+index 0000000..dc38bad
+--- /dev/null
++++ b/internal/control/mutations.go
+@@ -0,0 +1,241 @@
++package control
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"net/http"
++	"strconv"
++	"strings"
++
++	configschema "github.com/duvu/ya-router/internal/config"
++	statepkg "github.com/duvu/ya-router/internal/state"
++)
++
++type MutationResult struct {
++	Revision        uint64   `json:"revision"`
++	Digest          string   `json:"digest"`
++	EffectiveDigest string   `json:"effective_digest"`
++	ChangedPaths    []string `json:"changed_paths,omitempty"`
++	RestartRequired []string `json:"restart_required,omitempty"`
++	DrainCompleted  bool     `json:"drain_completed"`
++	DrainTimedOut   bool     `json:"drain_timed_out"`
++}
++
++type ProviderPatch struct {
++	Enabled       *bool     `json:"enabled,omitempty"`
++	AllowedModels *[]string `json:"allowed_models,omitempty"`
++}
++
++type AccountPatch struct {
++	Enabled  *bool   `json:"enabled,omitempty"`
++	Label    *string `json:"label,omitempty"`
++	Priority *int    `json:"priority,omitempty"`
++}
++
++type RoutingPatch struct {
++	DefaultModel    *string                                `json:"default_model,omitempty"`
++	DefaultProvider *string                                `json:"default_provider,omitempty"`
++	ModelMap        *map[string]configschema.ModelMapEntry `json:"model_map,omitempty"`
++}
++
++type MutationBackend interface {
++	ValidateConfig(context.Context, *configschema.Config) (statepkg.Preview, error)
++	ApplyConfig(context.Context, uint64, *configschema.Config, string) (MutationResult, error)
++	RollbackConfig(context.Context, uint64, string) (MutationResult, error)
++	PatchProvider(context.Context, uint64, string, ProviderPatch, string) (MutationResult, error)
++	PatchAccount(context.Context, uint64, string, string, AccountPatch, string) (MutationResult, error)
++	DeleteAccount(context.Context, uint64, string, string, string) (MutationResult, error)
++	PatchRouting(context.Context, uint64, RoutingPatch, string) (MutationResult, error)
++}
++
++func RegisterMutationRoutes(api *API, backend MutationBackend) {
++	if backend == nil {
++		return
++	}
++	api.Handle(http.MethodPost, "/control/v1/config:validate", RoleAdmin, true, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
++		var input struct {
++			Desired *configschema.Config `json:"desired"`
++		}
++		if err := decodeMutationJSON(request, &input); err != nil || input.Desired == nil {
++			writeError(writer, request, http.StatusBadRequest, "invalid_config_candidate", "A desired configuration is required.", false, nil)
++			return
++		}
++		preview, err := backend.ValidateConfig(request.Context(), input.Desired)
++		if err != nil {
++			writeMutationError(writer, request, err)
++			return
++		}
++		writeJSON(writer, http.StatusOK, preview)
++	}))
++	api.Handle(http.MethodPatch, "/control/v1/config", RoleAdmin, true, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
++		var input struct {
++			ExpectedRevision uint64               `json:"expected_revision"`
++			Desired          *configschema.Config `json:"desired"`
++		}
++		if err := decodeMutationJSON(request, &input); err != nil || input.Desired == nil {
++			writeError(writer, request, http.StatusBadRequest, "invalid_config_candidate", "A desired configuration is required.", false, nil)
++			return
++		}
++		expected, err := expectedRevision(request, input.ExpectedRevision)
++		if err != nil {
++			writeError(writer, request, http.StatusPreconditionRequired, "expected_revision_required", "If-Match or expected_revision is required.", false, nil)
++			return
++		}
++		identity, _ := IdentityFromContext(request.Context())
++		result, err := backend.ApplyConfig(request.Context(), expected, input.Desired, identity.Subject)
++		if err != nil {
++			writeMutationError(writer, request, err)
++			return
++		}
++		writeJSON(writer, http.StatusOK, result)
++	}))
++	api.Handle(http.MethodPost, "/control/v1/config:rollback", RoleAdmin, true, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
++		var input struct {
++			ExpectedRevision uint64 `json:"expected_revision"`
++		}
++		_ = decodeMutationJSON(request, &input)
++		expected, err := expectedRevision(request, input.ExpectedRevision)
++		if err != nil {
++			writeError(writer, request, http.StatusPreconditionRequired, "expected_revision_required", "If-Match or expected_revision is required.", false, nil)
++			return
++		}
++		identity, _ := IdentityFromContext(request.Context())
++		result, err := backend.RollbackConfig(request.Context(), expected, identity.Subject)
++		if err != nil {
++			writeMutationError(writer, request, err)
++			return
++		}
++		writeJSON(writer, http.StatusOK, result)
++	}))
++	api.HandlePrefix(http.MethodPatch, "/control/v1/providers/", RoleOperator, true, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
++		tail := pathTail(request.URL.Path, "/control/v1/providers/")
++		parts := strings.Split(tail, "/")
++		identity, _ := IdentityFromContext(request.Context())
++		var result MutationResult
++		var err error
++		switch {
++		case len(parts) == 1 && parts[0] != "":
++			var envelope struct {
++				ExpectedRevision uint64    `json:"expected_revision"`
++				Enabled          *bool     `json:"enabled,omitempty"`
++				AllowedModels    *[]string `json:"allowed_models,omitempty"`
++			}
++			if err := decodeMutationJSON(request, &envelope); err != nil {
++				writeError(writer, request, http.StatusBadRequest, "invalid_mutation", "The provider mutation request is invalid.", false, nil)
++				return
++			}
++			expected, revisionErr := expectedRevision(request, envelope.ExpectedRevision)
++			if revisionErr != nil {
++				writeError(writer, request, http.StatusPreconditionRequired, "expected_revision_required", "If-Match or expected_revision is required.", false, nil)
++				return
++			}
++			result, err = backend.PatchProvider(request.Context(), expected, parts[0], ProviderPatch{Enabled: envelope.Enabled, AllowedModels: envelope.AllowedModels}, identity.Subject)
++		case len(parts) == 3 && parts[1] == "accounts":
++			var envelope struct {
++				ExpectedRevision uint64  `json:"expected_revision"`
++				Enabled          *bool   `json:"enabled,omitempty"`
++				Label            *string `json:"label,omitempty"`
++				Priority         *int    `json:"priority,omitempty"`
++			}
++			if err := decodeMutationJSON(request, &envelope); err != nil {
++				writeError(writer, request, http.StatusBadRequest, "invalid_mutation", "The account mutation request is invalid.", false, nil)
++				return
++			}
++			expected, revisionErr := expectedRevision(request, envelope.ExpectedRevision)
++			if revisionErr != nil {
++				writeError(writer, request, http.StatusPreconditionRequired, "expected_revision_required", "If-Match or expected_revision is required.", false, nil)
++				return
++			}
++			result, err = backend.PatchAccount(request.Context(), expected, parts[0], parts[2], AccountPatch{Enabled: envelope.Enabled, Label: envelope.Label, Priority: envelope.Priority}, identity.Subject)
++		default:
++			writeError(writer, request, http.StatusNotFound, "control_resource_not_found", "The control resource was not found.", false, nil)
++			return
++		}
++		if err != nil {
++			writeMutationError(writer, request, err)
++			return
++		}
++		writeJSON(writer, http.StatusOK, result)
++	}))
++	api.HandlePrefix(http.MethodDelete, "/control/v1/providers/", RoleAdmin, true, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
++		tail := pathTail(request.URL.Path, "/control/v1/providers/")
++		parts := strings.Split(tail, "/")
++		if len(parts) != 3 || parts[1] != "accounts" {
++			writeError(writer, request, http.StatusNotFound, "control_resource_not_found", "The control resource was not found.", false, nil)
++			return
++		}
++		expected, err := expectedRevision(request, 0)
++		if err != nil {
++			writeError(writer, request, http.StatusPreconditionRequired, "expected_revision_required", "If-Match is required.", false, nil)
++			return
++		}
++		identity, _ := IdentityFromContext(request.Context())
++		result, err := backend.DeleteAccount(request.Context(), expected, parts[0], parts[2], identity.Subject)
++		if err != nil {
++			writeMutationError(writer, request, err)
++			return
++		}
++		writeJSON(writer, http.StatusOK, result)
++	}))
++	api.Handle(http.MethodPatch, "/control/v1/routing", RoleAdmin, true, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
++		var envelope struct {
++			ExpectedRevision uint64 `json:"expected_revision"`
++			RoutingPatch
++		}
++		if err := decodeMutationJSON(request, &envelope); err != nil {
++			writeError(writer, request, http.StatusBadRequest, "invalid_mutation", "The routing mutation is invalid.", false, nil)
++			return
++		}
++		expected, err := expectedRevision(request, envelope.ExpectedRevision)
++		if err != nil {
++			writeError(writer, request, http.StatusPreconditionRequired, "expected_revision_required", "If-Match or expected_revision is required.", false, nil)
++			return
++		}
++		identity, _ := IdentityFromContext(request.Context())
++		result, err := backend.PatchRouting(request.Context(), expected, envelope.RoutingPatch, identity.Subject)
++		if err != nil {
++			writeMutationError(writer, request, err)
++			return
++		}
++		writeJSON(writer, http.StatusOK, result)
++	}))
++}
++
++func decodeMutationJSON(request *http.Request, destination any) error {
++	if request.Body == nil {
++		return io.EOF
++	}
++	decoder := json.NewDecoder(io.LimitReader(request.Body, 2<<20))
++	decoder.DisallowUnknownFields()
++	return decoder.Decode(destination)
++}
++func expectedRevision(request *http.Request, body uint64) (uint64, error) {
++	if body > 0 {
++		return body, nil
++	}

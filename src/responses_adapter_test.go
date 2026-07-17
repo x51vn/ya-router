@@ -209,6 +209,31 @@ func TestBuildNativeResponsesRequests(t *testing.T) {
 	}
 }
 
+func TestBuildChatGPTNativeResponsesRequestNormalizesStringInputToList(t *testing.T) {
+	// Given
+	input := []byte(`{"model":"gpt-5.4","input":"hello"}`)
+
+	// When
+	output, _, err := buildChatGPTNativeResponsesRequest(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Then
+	var request struct {
+		Input []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"input"`
+	}
+	if err := json.Unmarshal(output, &request); err != nil {
+		t.Fatalf("decode normalized request: %v", err)
+	}
+	if len(request.Input) != 1 || request.Input[0].Role != "user" || request.Input[0].Content != "hello" {
+		t.Fatalf("input = %+v, want one user message", request.Input)
+	}
+}
+
 func TestBuildChatGPTNativeResponsesRequestRejectsUnknownField(t *testing.T) {
 	input := []byte(`{"model":"gpt-5.4","input":"hello","unknown":true}`)
 	if _, _, err := buildChatGPTNativeResponsesRequest(input); err == nil {
@@ -254,6 +279,52 @@ func TestAggregateSSEToCompletion(t *testing.T) {
 	}
 	if !strings.Contains(string(output), `"id":"r1"`) {
 		t.Fatalf("unexpected aggregate: %s", output)
+	}
+}
+
+func TestAggregateSSEToCompletionMergesTextDeltasWhenOutputEmpty(t *testing.T) {
+	stream := "event: response.output_text.delta\ndata: {\"delta\":\"Hel\"}\n\n" +
+		"event: response.output_text.delta\ndata: {\"delta\":\"lo\"}\n\n" +
+		"event: response.completed\ndata: {\"response\":{\"id\":\"r1\",\"output\":[]}}\n\n"
+	output, err := aggregateSSEToCompletion(strings.NewReader(stream))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(output), `"text":"Hello"`) {
+		t.Fatalf("expected accumulated delta text in output, got: %s", output)
+	}
+}
+
+func TestAggregateSSEToCompletionKeepsExistingOutputOverDeltas(t *testing.T) {
+	stream := "event: response.output_text.delta\ndata: {\"delta\":\"ignored\"}\n\n" +
+		"event: response.completed\ndata: {\"response\":{\"id\":\"r1\",\"output\":[{\"type\":\"message\"}]}}\n\n"
+	output, err := aggregateSSEToCompletion(strings.NewReader(stream))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(output), "ignored") {
+		t.Fatalf("delta text should not override a non-empty output array: %s", output)
+	}
+}
+
+func TestMergeAccumulatedTextSynthesizesOutputFromDeltas(t *testing.T) {
+	merged, err := mergeAccumulatedText([]byte(`{"id":"r1","output":[]}`), "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(merged), `"text":"hello"`) || !strings.Contains(string(merged), `"role":"assistant"`) {
+		t.Fatalf("expected synthesized assistant message, got: %s", merged)
+	}
+}
+
+func TestMergeAccumulatedTextNoopWhenTextEmpty(t *testing.T) {
+	original := []byte(`{"id":"r1","output":[]}`)
+	merged, err := mergeAccumulatedText(original, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(merged) != string(original) {
+		t.Fatalf("expected unchanged response when no delta text, got: %s", merged)
 	}
 }
 

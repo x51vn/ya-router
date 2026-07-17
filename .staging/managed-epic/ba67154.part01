@@ -1,0 +1,314 @@
++	value := strings.Trim(strings.TrimSpace(request.Header.Get("If-Match")), "\"")
++	if value == "" {
++		return 0, errors.New("missing revision")
++	}
++	return strconv.ParseUint(value, 10, 64)
++}
++func writeMutationError(writer http.ResponseWriter, request *http.Request, err error) {
++	var conflict *statepkg.ConflictError
++	switch {
++	case errors.As(err, &conflict):
++		writeError(writer, request, http.StatusConflict, "config_revision_conflict", "Configuration changed; reload before applying.", false, map[string]any{"expected_revision": conflict.Expected, "current_revision": conflict.Current})
++	case strings.Contains(err.Error(), "not found"):
++		writeError(writer, request, http.StatusNotFound, "mutation_target_not_found", "The mutation target was not found.", false, nil)
++	default:
++		writeError(writer, request, http.StatusUnprocessableEntity, "configuration_rejected", "The configuration change was rejected.", false, nil)
++	}
++}
++
++func pathTail(path, prefix string) string {
++	if !strings.HasPrefix(path, prefix) {
++		return ""
++	}
++	return strings.TrimPrefix(path, prefix)
++}
+diff --git a/openspec/changes/add-managed-service-and-tui/tasks.md b/openspec/changes/add-managed-service-and-tui/tasks.md
+index 2d9b08d..fe4219a 100644
+--- a/openspec/changes/add-managed-service-and-tui/tasks.md
++++ b/openspec/changes/add-managed-service-and-tui/tasks.md
+@@ -19,7 +19,7 @@
+ - [x] [YA-TUI-05 (#11)](https://github.com/duvu/ya-router/issues/11) add read-only control resources.
+ - [x] [YA-TUI-06 (#12)](https://github.com/duvu/ya-router/issues/12) add async operation/auth-session framework.
+ - [x] [YA-TUI-07 (#13)](https://github.com/duvu/ya-router/issues/13) add provider auth adapters and secret store.
+-- [ ] [YA-TUI-08 (#14)](https://github.com/duvu/ya-router/issues/14) add revision-safe mutations and hot reload.
++- [x] [YA-TUI-08 (#14)](https://github.com/duvu/ya-router/issues/14) add revision-safe mutations and hot reload.
+ - [ ] [YA-TUI-09 (#15)](https://github.com/duvu/ya-router/issues/15) add client SDK and scriptable commands.
+ - [ ] [YA-TUI-10 (#16)](https://github.com/duvu/ya-router/issues/16) add read-only TUI.
+ - [ ] [YA-TUI-11 (#17)](https://github.com/duvu/ya-router/issues/17) add auth and mutation TUI workflows.
+diff --git a/src/control_runtime.go b/src/control_runtime.go
+index 584799f..70747bd 100644
+--- a/src/control_runtime.go
++++ b/src/control_runtime.go
+@@ -103,6 +103,8 @@ func newManagedControlRuntime(config *Config, runtimeManager *runtimepkg.Manager
+ 			"operation_events",
+ 			"persistent_operations",
+ 			"managed_authentication",
++			"revision_safe_mutations",
++			"hot_reload",
+ 			"write_only_secret_store",
+ 			"secret_key_rotation",
+ 			"request_id",
+@@ -129,6 +131,7 @@ func newManagedControlRuntime(config *Config, runtimeManager *runtimepkg.Manager
+ 	controlpkg.RegisterReadRoutes(api, newControlReadModel(runtimeManager, providerManager, operationManager))
+ 	controlpkg.RegisterOperationRoutes(api, operationManager, authController)
+ 	controlpkg.RegisterSecretRoutes(api, authController)
++	controlpkg.RegisterMutationRoutes(api, newManagedMutationController(providerManager, managedSecrets))
+ 	localIdentity := controlpkg.Identity{Subject: "local:unix-socket", Role: controlpkg.RoleAdmin, Source: "unix_socket"}
+ 	localHandler := api.Handler(controlpkg.FixedAuthenticator(localIdentity))
+ 
+diff --git a/src/managed_runtime.go b/src/managed_runtime.go
+index 0a746c1..b62dad7 100644
+--- a/src/managed_runtime.go
++++ b/src/managed_runtime.go
+@@ -196,7 +196,7 @@ func copilotAccountState(config *Config) []providerpkg.AccountState {
+ 		accounts = append(accounts, providerpkg.AccountState{
+ 			ID:       account.ID,
+ 			Label:    account.Label,
+-			Enabled:  true,
++			Enabled:  !account.Disabled,
+ 			Priority: index,
+ 		})
+ 	}
+@@ -212,7 +212,7 @@ func codexAccountState(config *Config) []providerpkg.AccountState {
+ 		accounts = append(accounts, providerpkg.AccountState{
+ 			ID:       account.ID,
+ 			Label:    account.Label,
+-			Enabled:  true,
++			Enabled:  !account.Disabled,
+ 			Priority: index,
+ 		})
+ 	}
+diff --git a/src/mutation_controller.go b/src/mutation_controller.go
+new file mode 100644
+index 0000000..f9edb82
+--- /dev/null
++++ b/src/mutation_controller.go
+@@ -0,0 +1,475 @@
++package yarouter
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"sort"
++	"strings"
++
++	configschema "github.com/duvu/ya-router/internal/config"
++	controlpkg "github.com/duvu/ya-router/internal/control"
++	providerpkg "github.com/duvu/ya-router/internal/provider"
++	statepkg "github.com/duvu/ya-router/internal/state"
++)
++
++// managedMutationController is the only Control API path allowed to change
++// desired/effective configuration. It never invokes an OS service manager or
++// shell and never mutates a provider instance serving requests in place.
++type managedMutationController struct {
++	providers *providerpkg.Manager
++	secrets   *managedSecretStore
++}
++
++func newManagedMutationController(providers *providerpkg.Manager, secrets *managedSecretStore) *managedMutationController {
++	return &managedMutationController{providers: providers, secrets: secrets}
++}
++
++func (controller *managedMutationController) ValidateConfig(ctx context.Context, desired *Config) (statepkg.Preview, error) {
++	state := currentConfigState()
++	if state == nil {
++		return statepkg.Preview{}, fmt.Errorf("managed configuration state is unavailable")
++	}
++	candidate := configschema.Clone(desired)
++	if err := validateManagementCandidate(candidate); err != nil {
++		return statepkg.Preview{}, err
++	}
++	effective := hotEffectiveConfig(state.Snapshot().Effective, candidate)
++	if _, err := materializeManagedSecrets(ctx, effective, controller.secretStore()); err != nil {
++		return statepkg.Preview{}, err
++	}
++	return state.Validate(candidate, effective)
++}
++
++func (controller *managedMutationController) ApplyConfig(ctx context.Context, expected uint64, desired *Config, actor string) (controlpkg.MutationResult, error) {
++	return controller.apply(ctx, expected, desired, actor)
++}
++
++func (controller *managedMutationController) RollbackConfig(ctx context.Context, expected uint64, actor string) (controlpkg.MutationResult, error) {
++	managementMutationMu.Lock()
++	defer managementMutationMu.Unlock()
++	state := currentConfigState()
++	if state == nil {
++		return controlpkg.MutationResult{}, fmt.Errorf("managed configuration state is unavailable")
++	}
++	before := state.Snapshot()
++	if expected != before.Revision {
++		return controlpkg.MutationResult{}, &statepkg.ConflictError{Expected: expected, Current: before.Revision}
++	}
++	rolled, err := state.Rollback(expected, actor)
++	if err != nil {
++		return controlpkg.MutationResult{}, err
++	}
++	effectiveRefs := hotEffectiveConfig(before.Effective, rolled.Desired)
++	materialized, err := materializeManagedSecrets(ctx, effectiveRefs, controller.secretStore())
++	if err != nil {
++		return controlpkg.MutationResult{}, fmt.Errorf("materialize rollback configuration: %w", err)
++	}
++	drain, err := controller.providers.Reconcile(ctx, desiredProviders(materialized))
++	if err != nil {
++		// Desired rollback is durable but cannot safely become effective. Retain the
++		// previous effective snapshot and surface restart-required state.
++		return mutationResult(rolled, statepkg.Preview{ChangedPaths: rolled.RestartRequired}, providerpkg.DrainReport{}), fmt.Errorf("apply rollback runtime: %w", err)
++	}
++	final, err := state.SetEffective(rolled.Revision, effectiveRefs, actor)
++	if err != nil {
++		previous, previousErr := materializeManagedSecrets(context.Background(), before.Effective, controller.secretStore())
++		if previousErr == nil {
++			_, _ = controller.providers.Reconcile(context.Background(), desiredProviders(previous))
++		}
++		return controlpkg.MutationResult{}, err
++	}
++	preview, _ := state.Validate(final.Desired, final.Effective)
++	return mutationResult(final, preview, drain), nil
++}
++
++func (controller *managedMutationController) PatchProvider(ctx context.Context, expected uint64, provider string, patch controlpkg.ProviderPatch, actor string) (controlpkg.MutationResult, error) {
++	candidate, err := controller.currentCandidate(expected)
++	if err != nil {
++		return controlpkg.MutationResult{}, err
++	}
++	switch providerpkg.ID(provider) {
++	case providerpkg.Copilot:
++		if patch.Enabled != nil {
++			candidate.Providers.Copilot.Enabled = *patch.Enabled
++		}
++		if patch.AllowedModels != nil {
++			candidate.Providers.Copilot.AllowedModels = cleanModelList(*patch.AllowedModels)
++		}
++	case providerpkg.Codex:
++		if patch.Enabled != nil {
++			candidate.Providers.Codex.Enabled = *patch.Enabled
++		}
++		if patch.AllowedModels != nil {
++			candidate.Providers.Codex.AllowedModels = cleanModelList(*patch.AllowedModels)
++		}
++	case providerpkg.Kilo:
++		if patch.Enabled != nil {
++			candidate.Providers.Kilo.Enabled = *patch.Enabled
++		}
++		if patch.AllowedModels != nil {
++			candidate.Providers.Kilo.AllowedModels = cleanModelList(*patch.AllowedModels)
++		}
++	default:
++		return controlpkg.MutationResult{}, fmt.Errorf("provider %q not found", provider)
++	}
++	return controller.apply(ctx, expected, candidate, actor)
++}
++
++func (controller *managedMutationController) PatchAccount(ctx context.Context, expected uint64, provider, account string, patch controlpkg.AccountPatch, actor string) (controlpkg.MutationResult, error) {
++	candidate, err := controller.currentCandidate(expected)
++	if err != nil {
++		return controlpkg.MutationResult{}, err
++	}
++	switch providerpkg.ID(provider) {
++	case providerpkg.Copilot:
++		index := findCopilotAccount(candidate.Providers.Copilot.Accounts, account)
++		if index < 0 {
++			return controlpkg.MutationResult{}, fmt.Errorf("account %q not found", account)
++		}
++		if patch.Enabled != nil {
++			candidate.Providers.Copilot.Accounts[index].Disabled = !*patch.Enabled
++		}
++		if patch.Label != nil {
++			candidate.Providers.Copilot.Accounts[index].Label = strings.TrimSpace(*patch.Label)
++		}
++		if patch.Priority != nil {
++			candidate.Providers.Copilot.Accounts = moveCopilotAccount(candidate.Providers.Copilot.Accounts, index, *patch.Priority)
++		}
++	case providerpkg.Codex:
++		index := findCodexAccount(candidate.Providers.Codex.Accounts, account)
++		if index < 0 {
++			return controlpkg.MutationResult{}, fmt.Errorf("account %q not found", account)
++		}
++		if patch.Enabled != nil {
++			candidate.Providers.Codex.Accounts[index].Disabled = !*patch.Enabled
++		}
++		if patch.Label != nil {
++			candidate.Providers.Codex.Accounts[index].Label = strings.TrimSpace(*patch.Label)
++		}
++		if patch.Priority != nil {
++			candidate.Providers.Codex.Accounts = moveCodexAccount(candidate.Providers.Codex.Accounts, index, *patch.Priority)
++		}
++	default:
++		return controlpkg.MutationResult{}, fmt.Errorf("provider %q does not expose managed accounts", provider)
++	}
++	return controller.apply(ctx, expected, candidate, actor)
++}
++
++func (controller *managedMutationController) DeleteAccount(ctx context.Context, expected uint64, provider, account, actor string) (controlpkg.MutationResult, error) {
++	candidate, err := controller.currentCandidate(expected)
++	if err != nil {
++		return controlpkg.MutationResult{}, err
++	}
++	var refs []*SecretReference
++	switch providerpkg.ID(provider) {
++	case providerpkg.Copilot:
++		index := findCopilotAccount(candidate.Providers.Copilot.Accounts, account)
++		if index < 0 {
++			return controlpkg.MutationResult{}, fmt.Errorf("account %q not found", account)
++		}
++		auth := candidate.Providers.Copilot.Accounts[index].Auth
++		refs = append(refs, auth.GitHubTokenRef, auth.CopilotTokenRef)
++		candidate.Providers.Copilot.Accounts = append(candidate.Providers.Copilot.Accounts[:index], candidate.Providers.Copilot.Accounts[index+1:]...)
++	case providerpkg.Codex:
++		index := findCodexAccount(candidate.Providers.Codex.Accounts, account)
++		if index < 0 {
++			return controlpkg.MutationResult{}, fmt.Errorf("account %q not found", account)
++		}
++		auth := candidate.Providers.Codex.Accounts[index].Auth
++		refs = append(refs, auth.APIKeyRef, auth.AccessTokenRef, auth.RefreshTokenRef)
++		candidate.Providers.Codex.Accounts = append(candidate.Providers.Codex.Accounts[:index], candidate.Providers.Codex.Accounts[index+1:]...)
++	default:
++		return controlpkg.MutationResult{}, fmt.Errorf("provider %q does not expose removable accounts", provider)
++	}
++	result, err := controller.apply(ctx, expected, candidate, actor)
++	if err != nil {
++		return controlpkg.MutationResult{}, err
++	}
++	for _, ref := range refs {
++		if ref != nil && !ref.ReadOnly {
++			_ = controller.secretStore().Delete(context.Background(), ref)
++		}
++	}
++	return result, nil
++}
++
++func (controller *managedMutationController) PatchRouting(ctx context.Context, expected uint64, patch controlpkg.RoutingPatch, actor string) (controlpkg.MutationResult, error) {
++	candidate, err := controller.currentCandidate(expected)
++	if err != nil {
++		return controlpkg.MutationResult{}, err
++	}
++	if patch.DefaultModel != nil {
++		candidate.Routing.DefaultModel = strings.TrimSpace(*patch.DefaultModel)
++	}
++	if patch.DefaultProvider != nil {
++		candidate.Routing.DefaultProvider = strings.TrimSpace(*patch.DefaultProvider)
++	}
++	if patch.ModelMap != nil {
++		candidate.Routing.ModelMap = cloneMutationModelMap(*patch.ModelMap)
++	}
++	return controller.apply(ctx, expected, candidate, actor)
++}
++
++func (controller *managedMutationController) currentCandidate(expected uint64) (*Config, error) {
++	state := currentConfigState()
++	if state == nil {
++		return nil, fmt.Errorf("managed configuration state is unavailable")
++	}
++	snapshot := state.Snapshot()
++	if snapshot.Revision != expected {
++		return nil, &statepkg.ConflictError{Expected: expected, Current: snapshot.Revision}
++	}
++	return configschema.Clone(snapshot.Desired), nil
++}
++
++func (controller *managedMutationController) apply(ctx context.Context, expected uint64, desired *Config, actor string) (controlpkg.MutationResult, error) {
++	managementMutationMu.Lock()
++	defer managementMutationMu.Unlock()

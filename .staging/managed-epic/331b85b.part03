@@ -1,0 +1,352 @@
++		controller.sessions[operation.ID] = authSessionTransient{owner: request.Owner, provider: request.Provider, account: request.Account, mode: request.Mode, expiresAt: request.ExpiresAt, cancel: cancel}
++		controller.mu.Unlock()
++		go controller.completeSecret(workerContext, operation.ID, request.Provider, request.Account, request.Mode, adapter, secretCopy)
++		return controller.viewFor(operation), true, nil
++	case "anonymous":
++		workerContext, cancel := context.WithCancel(context.Background())
++		controller.mu.Lock()
++		controller.sessions[operation.ID] = authSessionTransient{owner: request.Owner, provider: request.Provider, account: request.Account, mode: request.Mode, expiresAt: request.ExpiresAt, cancel: cancel}
++		controller.mu.Unlock()
++		go controller.completeAnonymous(workerContext, operation.ID, request.Provider, request.Account, adapter)
++		return controller.viewFor(operation), true, nil
++	default:
++		return controlpkg.AuthSessionView{}, false, fmt.Errorf("unsupported authentication mode")
++	}
++}
++
++func (controller *managedAuthController) AuthSession(_ context.Context, id, owner string, admin bool) (controlpkg.AuthSessionView, error) {
++	operation, err := controller.authorizedOperation(id, owner, admin)
++	if err != nil {
++		return controlpkg.AuthSessionView{}, err
++	}
++	if !strings.HasPrefix(operation.Kind, "auth_") {
++		return controlpkg.AuthSessionView{}, &operationpkg.NotFoundError{ID: id}
++	}
++	view := controller.viewFor(operation)
++	controller.mu.RLock()
++	transient, exists := controller.sessions[id]
++	controller.mu.RUnlock()
++	if exists && (admin || transient.owner == owner) {
++		view.VerificationURI = transient.verificationURI
++		view.UserCode = transient.userCode
++	}
++	return view, nil
++}
++
++func (controller *managedAuthController) CancelAuthSession(_ context.Context, id, owner string, admin bool) (controlpkg.AuthSessionView, error) {
++	operation, err := controller.authorizedOperation(id, owner, admin)
++	if err != nil {
++		return controlpkg.AuthSessionView{}, err
++	}
++	if !strings.HasPrefix(operation.Kind, "auth_") {
++		return controlpkg.AuthSessionView{}, &operationpkg.NotFoundError{ID: id}
++	}
++	controller.mu.Lock()
++	transient, exists := controller.sessions[id]
++	if exists && transient.cancel != nil {
++		transient.cancel()
++	}
++	delete(controller.sessions, id)
++	controller.mu.Unlock()
++	operation, err = controller.operations.Cancel(id)
++	if err != nil {
++		return controlpkg.AuthSessionView{}, err
++	}
++	return controller.viewFor(operation), nil
++}
++
++func (controller *managedAuthController) completeDevice(ctx context.Context, id, provider, account string, adapter managedAuthAdapter, challenge authChallenge) {
++	credential, err := challenge.Complete(ctx)
++	if err != nil {
++		controller.finishFailure(id, err)
++		return
++	}
++	controller.finishCredential(ctx, id, provider, account, credential)
++}
++func (controller *managedAuthController) completeSecret(ctx context.Context, id, provider, account, mode string, adapter managedAuthAdapter, value []byte) {
++	defer zeroSecretBytes(value)
++	_, _ = controller.operations.Transition(id, operationpkg.StateRunning, 25, nil, nil, "started")
++	credential, err := adapter.FromSecret(ctx, mode, value)
++	if err != nil {
++		controller.finishFailure(id, err)
++		return
++	}
++	controller.finishCredential(ctx, id, provider, account, credential)
++}
++func (controller *managedAuthController) completeAnonymous(ctx context.Context, id, provider, account string, adapter managedAuthAdapter) {
++	_, _ = controller.operations.Transition(id, operationpkg.StateRunning, 25, nil, nil, "started")
++	credential, err := adapter.Anonymous(ctx)
++	if err != nil {
++		controller.finishFailure(id, err)
++		return
++	}
++	controller.finishCredential(ctx, id, provider, account, credential)
++}
++func (controller *managedAuthController) finishCredential(ctx context.Context, id, provider, account string, credential managedCredential) {
++	_, _ = controller.operations.Transition(id, operationpkg.StateRunning, 70, nil, nil, "credential_validated")
++	if err := controller.applyCredential(ctx, provider, account, credential); err != nil {
++		controller.finishFailure(id, err)
++		return
++	}
++	_, _ = controller.operations.Transition(id, operationpkg.StateSucceeded, 100, map[string]string{"provider": provider, "account": account, "configured": "true"}, nil, "succeeded")
++	controller.clearSession(id)
++}
++func (controller *managedAuthController) finishFailure(id string, err error) {
++	retryable := !errors.Is(err, context.Canceled)
++	code := "authentication_failed"
++	if errors.Is(err, context.Canceled) {
++		code = "operation_cancelled"
++	}
++	_, _ = controller.operations.Transition(id, operationpkg.StateFailed, 0, nil, failureFor(code, retryable), "failed")
++	controller.clearSession(id)
++}
++func (controller *managedAuthController) clearSession(id string) {
++	controller.mu.Lock()
++	if current, ok := controller.sessions[id]; ok && current.cancel != nil {
++		current.cancel()
++	}
++	delete(controller.sessions, id)
++	controller.mu.Unlock()
++}
++
++func (controller *managedAuthController) authorizedOperation(id, owner string, admin bool) (operationpkg.Record, error) {
++	record, err := controller.operations.Get(id)
++	if err != nil {
++		return operationpkg.Record{}, err
++	}
++	if !admin && record.Owner != owner {
++		return operationpkg.Record{}, &operationpkg.NotFoundError{ID: id}
++	}
++	return record, nil
++}
++
++func failureFor(code string, retryable bool) *operationpkg.Failure {
++	failure := operationpkg.NewFailure(code, "", retryable)
++	return &failure
++}
++
++func (controller *managedAuthController) viewFor(operation operationpkg.Record) controlpkg.AuthSessionView {
++	provider, account := splitAuthTarget(operation.Target)
++	return controlpkg.AuthSessionView{Operation: operation, Provider: provider, Account: account, Mode: strings.TrimPrefix(operation.Kind, "auth_")}
++}
++
++func splitAuthTarget(target string) (string, string) {
++	parts := strings.SplitN(target, "/", 2)
++	if len(parts) == 2 {
++		return parts[0], parts[1]
++	}
++	return target, ""
++}
++
++func enforceCredentialPrecedence(provider, mode string) error {
++	if mode != "api_key" && mode != "recovery_token" {
++		return nil
++	}
++	switch provider {
++	case string(ProviderCodex):
++		if strings.TrimSpace(os.Getenv("OPENAI_API_KEY")) != "" {
++			return fmt.Errorf("credential source is read-only because OPENAI_API_KEY is configured")
++		}
++	case string(ProviderKilo):
++		if strings.TrimSpace(os.Getenv(kiloAPIKeyEnv)) != "" {
++			return fmt.Errorf("credential source is read-only because KILO_API_KEY is configured")
++		}
++	}
++	return nil
++}
++
++func (controller *managedAuthController) applyCredential(ctx context.Context, provider, account string, credential managedCredential) error {
++	managementMutationMu.Lock()
++	defer managementMutationMu.Unlock()
++	state := currentConfigState()
++	if state == nil {
++		return fmt.Errorf("managed configuration state is unavailable")
++	}
++	snapshot := state.Snapshot()
++	desired := configschema.Clone(snapshot.Desired)
++	refs := make([]*SecretReference, 0)
++	cleanup := func() {
++		for _, ref := range refs {
++			_ = controller.secrets.Delete(context.Background(), ref)
++		}
++	}
++	put := func(name string, value []byte) (*SecretReference, error) {
++		if len(value) == 0 {
++			return nil, nil
++		}
++		ref, err := controller.secrets.Put(ctx, name, value)
++		if err == nil {
++			refs = append(refs, ref)
++		}
++		return ref, err
++	}
++	switch provider {
++	case string(ProviderCopilot):
++		if credential.Copilot == nil {
++			return fmt.Errorf("Copilot credential is missing")
++		}
++		github := []byte(credential.Copilot.GitHubToken)
++		copilot := []byte(credential.Copilot.CopilotToken)
++		defer zeroSecretBytes(github)
++		defer zeroSecretBytes(copilot)
++		githubRef, err := put("copilot/"+account+"/github-token", github)
++		if err != nil {
++			cleanup()
++			return err
++		}
++		copilotRef, err := put("copilot/"+account+"/copilot-token", copilot)
++		if err != nil {
++			cleanup()
++			return err
++		}
++		auth := CopilotAuthState{Mode: credential.Copilot.Mode, GitHubTokenRef: githubRef, CopilotTokenRef: copilotRef, ExpiresAt: credential.Copilot.ExpiresAt, RefreshIn: credential.Copilot.RefreshIn}
++		setCopilotManagedAuth(desired, account, auth)
++		desired.Providers.Copilot.Enabled = true
++	case string(ProviderCodex):
++		if credential.Codex == nil {
++			return fmt.Errorf("Codex credential is missing")
++		}
++		api := []byte(credential.Codex.APIKey)
++		access := []byte(credential.Codex.AccessToken)
++		refresh := []byte(credential.Codex.RefreshToken)
++		defer zeroSecretBytes(api)
++		defer zeroSecretBytes(access)
++		defer zeroSecretBytes(refresh)
++		apiRef, err := put("codex/"+account+"/api-key", api)
++		if err != nil {
++			cleanup()
++			return err
++		}
++		accessRef, err := put("codex/"+account+"/access-token", access)
++		if err != nil {
++			cleanup()
++			return err
++		}
++		refreshRef, err := put("codex/"+account+"/refresh-token", refresh)
++		if err != nil {
++			cleanup()
++			return err
++		}
++		auth := CodexAuthState{Mode: credential.Codex.Mode, APIKeyRef: apiRef, AccessTokenRef: accessRef, RefreshTokenRef: refreshRef, ExpiresAt: credential.Codex.ExpiresAt}
++		setCodexManagedAuth(desired, account, auth)
++		desired.Providers.Codex.Enabled = true
++	case string(ProviderKilo):
++		desired.Providers.Kilo.Enabled = true
++		desired.Providers.Kilo.AllowAnonymous = credential.Anonymous
++		if len(credential.KiloKey) > 0 {
++			key := append([]byte(nil), credential.KiloKey...)
++			defer zeroSecretBytes(key)
++			ref, err := put("kilo/api-key", key)
++			if err != nil {
++				cleanup()
++				return err
++			}
++			desired.Providers.Kilo.APIKeyRef = ref
++			desired.Providers.Kilo.AllowAnonymous = true
++		}
++	default:
++		cleanup()
++		return fmt.Errorf("unsupported authentication provider")
++	}
++	effective, err := materializeManagedSecrets(ctx, desired, controller.secrets)
++	if err != nil {
++		cleanup()
++		return err
++	}
++	_, err = controller.providers.Reconcile(ctx, desiredProviders(effective))
++	if err != nil {
++		cleanup()
++		return err
++	}
++	_, err = state.Apply(snapshot.Revision, desired, desired, "control-auth", false)
++	if err != nil {
++		previous, materializeErr := materializeManagedSecrets(context.Background(), snapshot.Effective, controller.secrets)
++		if materializeErr == nil {
++			_, _ = controller.providers.Reconcile(context.Background(), desiredProviders(previous))
++		}
++		cleanup()
++		return err
++	}
++	return nil
++}
++
++func setCopilotManagedAuth(config *Config, account string, auth CopilotAuthState) {
++	if account == "" {
++		account = "primary"
++	}
++	for index := range config.Providers.Copilot.Accounts {
++		if config.Providers.Copilot.Accounts[index].Label == account {
++			config.Providers.Copilot.Accounts[index].Auth = auth
++			return
++		}
++	}
++	config.Providers.Copilot.Accounts = append(config.Providers.Copilot.Accounts, CopilotAccount{ID: stableAccountID("copilot", account), Label: account, Auth: auth})
++}
++func setCodexManagedAuth(config *Config, account string, auth CodexAuthState) {
++	if account == "" {
++		account = "primary"
++	}
++	for index := range config.Providers.Codex.Accounts {
++		if config.Providers.Codex.Accounts[index].Label == account {
++			config.Providers.Codex.Accounts[index].Auth = auth
++			return
++		}
++	}
++	config.Providers.Codex.Accounts = append(config.Providers.Codex.Accounts, CodexAccount{ID: stableAccountID("codex", account), Label: account, Auth: auth})
++}
++
++type copilotManagedAuthAdapter struct{}
++
++func (copilotManagedAuthAdapter) BeginDevice(ctx context.Context) (authChallenge, error) {
++	dc, err := beginCopilotDeviceFlow(ctx)
++	if err != nil {
++		return authChallenge{}, err
++	}
++	expires := time.Now().Add(time.Duration(dc.ExpiresIn) * time.Second)
++	return authChallenge{VerificationURI: dc.VerificationURI, UserCode: dc.UserCode, ExpiresAt: expires, Complete: func(ctx context.Context) (managedCredential, error) {
++		auth, err := completeCopilotDeviceFlow(ctx, dc)
++		return managedCredential{Copilot: &auth}, err
++	}}, nil
++}
++func (copilotManagedAuthAdapter) FromSecret(ctx context.Context, mode string, value []byte) (managedCredential, error) {
++	if mode != "recovery_token" {
++		return managedCredential{}, fmt.Errorf("Copilot supports device_code or recovery_token")
++	}
++	token, expires, refresh, err := getCopilotTokenContext(ctx, string(value))
++	if err != nil {
++		return managedCredential{}, err
++	}
++	auth := CopilotAuthState{Mode: "recovery_token", GitHubToken: string(value), CopilotToken: token, ExpiresAt: expires, RefreshIn: refresh}
++	return managedCredential{Copilot: &auth}, nil
++}
++func (copilotManagedAuthAdapter) Anonymous(context.Context) (managedCredential, error) {
++	return managedCredential{}, fmt.Errorf("Copilot does not support anonymous authentication")
++}
++
++type codexManagedAuthAdapter struct{}
++
++func (codexManagedAuthAdapter) BeginDevice(ctx context.Context) (authChallenge, error) {
++	flow, err := beginCodexDeviceFlow(ctx)
++	if err != nil {
++		return authChallenge{}, err
++	}
++	return authChallenge{VerificationURI: flow.VerificationURI, UserCode: flow.UserCode, ExpiresAt: flow.ExpiresAt, Complete: func(ctx context.Context) (managedCredential, error) {
++		auth, err := completeCodexDeviceFlow(ctx, flow)
++		return managedCredential{Codex: &auth}, err
++	}}, nil
++}
++func (codexManagedAuthAdapter) FromSecret(_ context.Context, mode string, value []byte) (managedCredential, error) {
++	switch mode {
++	case "api_key":
++		auth := CodexAuthState{Mode: "api_key", APIKey: string(value)}
++		return managedCredential{Codex: &auth}, nil
++	case "recovery_token":
++		auth := CodexAuthState{Mode: "chatgpt", AccessToken: string(value), ExpiresAt: extractJWTExpiry(string(value)), AccountID: extractAccountIDFromJWT(string(value))}
++		if auth.ExpiresAt == 0 {
++			auth.ExpiresAt = time.Now().Add(time.Hour).Unix()
++		}
++		return managedCredential{Codex: &auth}, nil
++	default:
++		return managedCredential{}, fmt.Errorf("unsupported Codex auth mode")
++	}
++}

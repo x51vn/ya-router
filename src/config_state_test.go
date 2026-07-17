@@ -94,9 +94,19 @@ func TestManagedConfigDryRunAndRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rolledBack.Desired.Port != baseline.Port || rolledBack.Desired.Providers.Codex.Auth.APIKey != "original-key" {
+	if rolledBack.Desired.Port != baseline.Port || codexAPIKeyForTest(rolledBack.Desired) != "original-key" {
 		t.Fatalf("rollback did not restore last-known-good config: %+v", rolledBack.Desired)
 	}
+}
+
+func codexAPIKeyForTest(config *Config) string {
+	if config.Providers.Codex.Auth.APIKey != "" {
+		return config.Providers.Codex.Auth.APIKey
+	}
+	if len(config.Providers.Codex.Accounts) > 0 {
+		return config.Providers.Codex.Accounts[0].Auth.APIKey
+	}
+	return ""
 }
 
 func configschemaCloneForTest(config *Config) *Config {

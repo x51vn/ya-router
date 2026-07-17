@@ -1,0 +1,381 @@
+From fb915d2511c742b2ba25eeedfe7504a393bec206 Mon Sep 17 00:00:00 2001
+From: OpenAI Agent <agent@openai.local>
+Date: Thu, 16 Jul 2026 00:22:20 +0000
+Subject: [PATCH] feat(client): add typed ya SDK and scriptable commands
+
+---
+ README.md                                     |   8 +-
+ docs/CONTROL_API.md                           |  14 +
+ docs/qa/ya-tui-09.md                          |   7 +
+ internal/client/client.go                     | 493 ++++++++++++++++++
+ internal/client/client_test.go                |  76 +++
+ .../add-managed-service-and-tui/tasks.md      |   2 +-
+ src/client_cli.go                             | 196 +++++++
+ src/client_cli_test.go                        |  51 ++
+ src/entrypoints_test.go                       |   2 +-
+ src/main.go                                   |  18 -
+ 10 files changed, 843 insertions(+), 24 deletions(-)
+ create mode 100644 docs/qa/ya-tui-09.md
+ create mode 100644 internal/client/client.go
+ create mode 100644 internal/client/client_test.go
+ create mode 100644 src/client_cli.go
+ create mode 100644 src/client_cli_test.go
+
+diff --git a/README.md b/README.md
+index 7d27ed9..4f074ee 100644
+--- a/README.md
++++ b/README.md
+@@ -60,8 +60,8 @@ build ya-router, ya-routerd, and ya
+ 
+ `make build` retains the compatibility output `./ya-router`. `make build-all`
+ also emits the service entrypoint `./ya-routerd` and the client foundation
+-`./ya`. The client transport and TUI are delivered by later roadmap issues;
+-the current `ya` binary intentionally exposes only help and version.
++`./ya`. The `ya` binary now provides typed non-interactive Control API commands;
++the interactive Bubble Tea surface is delivered in the next managed-client increment.
+ 
+ ## Target managed-service architecture
+ 
+@@ -75,14 +75,14 @@ OS client can be delivered incrementally without changing the `/v1/*` contract:
+ - [OpenSpec change](openspec/changes/add-managed-service-and-tui/proposal.md)
+ 
+ These documents remain the ordered implementation plan. The executable
+-foundations exist; the Control API and interactive TUI do not yet exist.
++foundations and the versioned Control API now exist; the typed `ya` automation client is available.
+ 
+ Data-plane handlers now use immutable, generation-tagged runtime snapshots.
+ Provider changes are constructed and validated before atomic publication;
+ in-flight requests retain their original snapshot while replaced instances
+ drain for a bounded, observable duration. Compiled-in provider descriptors
+ remain available independently from active instances, forming the lifecycle
+-foundation for the future Control API and TUI.
++foundation for the managed Control API, typed client, and TUI.
+ 
+ ## Planned umbrella model routing
+ 
+diff --git a/docs/CONTROL_API.md b/docs/CONTROL_API.md
+index 28b3e19..c32ad55 100644
+--- a/docs/CONTROL_API.md
++++ b/docs/CONTROL_API.md
+@@ -232,3 +232,17 @@ Stale writers receive `409`. Anonymous Kilo remains free-only, provider-prefixed
+ routing remains isolated, and no mutation invokes systemd, Docker, a shell, or
+ process self-restart. Port/listener changes are stored as desired state and
+ reported as restart-required rather than applied unsafely in-process.
++
++## `ya` typed client and automation commands
++
++The `ya` binary shares one typed SDK with the TUI. It supports local Unix
++sockets and remote HTTPS with independent token, OIDC-token, custom CA, and mTLS
++profile references. Token values are resolved from environment variables or
++files and are not stored in profiles.
++
++Non-interactive commands are `meta`, `providers`, `accounts`, `models`,
++`config`, `operations`, and `events`. `--json` emits the contract response
++without terminal decoration and works without a TTY. Exit codes distinguish
++usage, authorization, compatibility, revision conflict, connection, and generic
++failures. Mutations are not retried unless the same idempotency key and payload
++are retained, and client/server incompatibility fails before dispatch.
+diff --git a/docs/qa/ya-tui-09.md b/docs/qa/ya-tui-09.md
+new file mode 100644
+index 0000000..8c4cc12
+--- /dev/null
++++ b/docs/qa/ya-tui-09.md
+@@ -0,0 +1,7 @@
++# YA-TUI-09 acceptance evidence
++
++- Commands operate with ordinary pipes and no TTY.
++- JSON output and stable exit-code mapping are contract-tested.
++- Unix socket and HTTPS/mTLS/OIDC/token-file profiles share one typed SDK.
++- GET retries are bounded; mutations require an idempotency key and preserve the same body/key on retry.
++- N/N-1 compatibility is checked through `/control/v1/meta` before mutation dispatch.
+diff --git a/internal/client/client.go b/internal/client/client.go
+new file mode 100644
+index 0000000..7ef3fce
+--- /dev/null
++++ b/internal/client/client.go
+@@ -0,0 +1,493 @@
++// Package client implements the typed ya Control API client shared by CLI and TUI.
++package client
++
++import (
++	"bytes"
++	"context"
++	"crypto/tls"
++	"crypto/x509"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"os"
++	"path/filepath"
++	"strings"
++	"time"
++
++	configschema "github.com/duvu/ya-router/internal/config"
++	controlpkg "github.com/duvu/ya-router/internal/control"
++	statepkg "github.com/duvu/ya-router/internal/state"
++)
++
++const ClientVersion = controlpkg.CurrentClientVersion
++
++type Profile struct {
++	Name           string `json:"name,omitempty"`
++	UnixSocket     string `json:"unix_socket,omitempty"`
++	URL            string `json:"url,omitempty"`
++	TokenEnv       string `json:"token_env,omitempty"`
++	TokenFile      string `json:"token_file,omitempty"`
++	OIDCTokenEnv   string `json:"oidc_token_env,omitempty"`
++	CAFile         string `json:"ca_file,omitempty"`
++	ClientCert     string `json:"client_cert,omitempty"`
++	ClientKey      string `json:"client_key,omitempty"`
++	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
++}
++
++type Profiles struct {
++	Default  string             `json:"default,omitempty"`
++	Profiles map[string]Profile `json:"profiles"`
++}
++
++type Options struct {
++	Profile Profile
++	Timeout time.Duration
++	HTTP    *http.Client
++}
++
++type Client struct {
++	http    *http.Client
++	baseURL string
++	token   string
++}
++
++type APIError struct {
++	Status    int
++	Code      string
++	Message   string
++	Retryable bool
++	RequestID string
++	Details   map[string]any
++}
++
++func (err *APIError) Error() string {
++	if err.RequestID != "" {
++		return fmt.Sprintf("%s: %s (request_id=%s)", err.Code, err.Message, err.RequestID)
++	}
++	return fmt.Sprintf("%s: %s", err.Code, err.Message)
++}
++
++func New(options Options) (*Client, error) {
++	profile := options.Profile
++	timeout := options.Timeout
++	if timeout <= 0 && profile.TimeoutSeconds > 0 {
++		timeout = time.Duration(profile.TimeoutSeconds) * time.Second
++	}
++	if timeout <= 0 {
++		timeout = 30 * time.Second
++	}
++	baseURL := strings.TrimRight(strings.TrimSpace(profile.URL), "/")
++	transport := &http.Transport{}
++	if strings.TrimSpace(profile.UnixSocket) != "" {
++		socket := profile.UnixSocket
++		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
++			return (&net.Dialer{}).DialContext(ctx, "unix", socket)
++		}
++		baseURL = "http://unix"
++	} else {
++		if baseURL == "" {
++			return nil, fmt.Errorf("a Unix socket or HTTPS URL is required")
++		}
++		if !strings.HasPrefix(strings.ToLower(baseURL), "https://") {
++			return nil, fmt.Errorf("remote Control API URL must use HTTPS")
++		}
++		tlsConfig, err := profileTLS(profile)
++		if err != nil {
++			return nil, err
++		}
++		transport.TLSClientConfig = tlsConfig
++	}
++	httpClient := options.HTTP
++	if httpClient == nil {
++		httpClient = &http.Client{Transport: transport, Timeout: timeout}
++	}
++	token, err := resolveToken(profile)
++	if err != nil {
++		return nil, err
++	}
++	return &Client{http: httpClient, baseURL: baseURL, token: token}, nil
++}
++
++func LoadProfiles(path string) (Profiles, error) {
++	if strings.TrimSpace(path) == "" {
++		configured, err := os.UserConfigDir()
++		if err != nil {
++			return Profiles{}, err
++		}
++		path = filepath.Join(configured, "ya-router", "profiles.json")
++	}
++	data, err := os.ReadFile(path)
++	if err != nil {
++		if errors.Is(err, os.ErrNotExist) {
++			return Profiles{Profiles: map[string]Profile{}}, nil
++		}
++		return Profiles{}, err
++	}
++	var profiles Profiles
++	if err := json.Unmarshal(data, &profiles); err != nil {
++		return Profiles{}, fmt.Errorf("decode client profiles: %w", err)
++	}
++	if profiles.Profiles == nil {
++		profiles.Profiles = map[string]Profile{}
++	}
++	return profiles, nil
++}
++
++func (profiles Profiles) Resolve(name string) (Profile, error) {
++	if name == "" {
++		name = profiles.Default
++	}
++	if name == "" && len(profiles.Profiles) == 1 {
++		for key := range profiles.Profiles {
++			name = key
++		}
++	}
++	profile, ok := profiles.Profiles[name]
++	if !ok {
++		return Profile{}, fmt.Errorf("client profile %q was not found", name)
++	}
++	profile.Name = name
++	return profile, nil
++}
++
++func (client *Client) Meta(ctx context.Context) (controlpkg.MetaResponse, error) {
++	var result controlpkg.MetaResponse
++	err := client.do(ctx, http.MethodGet, "/control/v1/meta", nil, "", &result, true)
++	return result, err
++}
++
++func (client *Client) Providers(ctx context.Context) ([]controlpkg.ProviderResource, error) {
++	var envelope struct {
++		Data []controlpkg.ProviderResource `json:"data"`
++	}
++	err := client.do(ctx, http.MethodGet, "/control/v1/providers", nil, "", &envelope, true)
++	return envelope.Data, err
++}
++func (client *Client) Accounts(ctx context.Context) ([]controlpkg.AccountResource, error) {
++	var envelope struct {
++		Data []controlpkg.AccountResource `json:"data"`
++	}
++	err := client.do(ctx, http.MethodGet, "/control/v1/accounts", nil, "", &envelope, true)
++	return envelope.Data, err
++}
++func (client *Client) Models(ctx context.Context, refresh bool) (controlpkg.ModelCatalogResponse, error) {
++	path := "/control/v1/models"
++	if refresh {
++		path += "?refresh=true"
++	}
++	var result controlpkg.ModelCatalogResponse
++	err := client.do(ctx, http.MethodGet, path, nil, "", &result, true)
++	return result, err
++}
++func (client *Client) Configuration(ctx context.Context) (controlpkg.ConfigResource, error) {
++	var result controlpkg.ConfigResource
++	err := client.do(ctx, http.MethodGet, "/control/v1/config", nil, "", &result, true)
++	return result, err
++}
++func (client *Client) Operations(ctx context.Context) ([]controlpkg.OperationResource, error) {
++	var envelope struct {
++		Data []controlpkg.OperationResource `json:"data"`
++	}
++	err := client.do(ctx, http.MethodGet, "/control/v1/operations", nil, "", &envelope, true)
++	return envelope.Data, err
++}
++func (client *Client) Events(ctx context.Context, after uint64) (controlpkg.EventPage, error) {
++	path := fmt.Sprintf("/control/v1/events?after=%d", after)
++	var result controlpkg.EventPage
++	err := client.do(ctx, http.MethodGet, path, nil, "", &result, true)
++	return result, err
++}
++
++// Mutate performs a typed compatible mutation. Compatibility is checked before
++// request dispatch; network retries are permitted only with an idempotency key.
++func (client *Client) Mutate(ctx context.Context, method, path string, body any, idempotencyKey string, result any) error {
++	meta, err := client.Meta(ctx)
++	if err != nil {
++		return err
++	}
++	if !meta.Client.Compatible {
++		return &APIError{Status: http.StatusUpgradeRequired, Code: "unsupported_client_version", Message: "client/server versions are incompatible"}
++	}
++	if strings.TrimSpace(idempotencyKey) == "" {
++		return fmt.Errorf("idempotency key is required for mutations")
++	}
++	return client.do(ctx, method, path, body, idempotencyKey, result, true)
++}
++
++func (client *Client) do(ctx context.Context, method, path string, input any, idempotencyKey string, output any, retry bool) error {
++	var payload []byte
++	var err error
++	if input != nil {
++		payload, err = json.Marshal(input)
++		if err != nil {
++			return err
++		}
++	}
++	attempts := 1
++	if retry && (method == http.MethodGet || idempotencyKey != "") {
++		attempts = 3
++	}
++	for attempt := 0; attempt < attempts; attempt++ {
++		request, requestErr := http.NewRequestWithContext(ctx, method, client.baseURL+path, bytes.NewReader(payload))
++		if requestErr != nil {
++			return requestErr
++		}
++		request.Header.Set("Accept", "application/json")
++		request.Header.Set(controlpkg.ClientVersionHeader, ClientVersion)
++		if input != nil {
++			request.Header.Set("Content-Type", "application/json")
++		}
++		if client.token != "" {
++			request.Header.Set("Authorization", "Bearer "+client.token)
++		}
++		if idempotencyKey != "" {
++			request.Header.Set(controlpkg.IdempotencyKeyHeader, idempotencyKey)
++		}
++		response, requestErr := client.http.Do(request)
++		if requestErr != nil {
++			if attempt+1 < attempts && ctx.Err() == nil {
++				time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
++				continue
++			}
++			return requestErr
++		}
++		data, readErr := io.ReadAll(io.LimitReader(response.Body, 8<<20))
++		_ = response.Body.Close()
++		if readErr != nil {
++			return readErr
++		}
++		if response.StatusCode >= 200 && response.StatusCode < 300 {
++			if output == nil || len(bytes.TrimSpace(data)) == 0 {
++				return nil
++			}
++			if err := json.Unmarshal(data, output); err != nil {
++				return fmt.Errorf("decode Control API response: %w", err)
++			}
++			return nil
++		}
++		apiErr := decodeAPIError(response.StatusCode, response.Header.Get(controlpkg.RequestIDHeader), data)
++		if attempt+1 < attempts && apiErr.Retryable && response.StatusCode >= 500 {
++			time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
++			continue
++		}
++		return apiErr
++	}
++	return fmt.Errorf("Control API request exhausted retries")
++}
++
++func decodeAPIError(status int, requestID string, data []byte) *APIError {
++	var envelope controlpkg.ErrorEnvelope
++	if json.Unmarshal(data, &envelope) == nil && envelope.Error.Code != "" {
++		return &APIError{Status: status, Code: envelope.Error.Code, Message: envelope.Error.Message, Retryable: envelope.Error.Retryable, RequestID: envelope.Error.RequestID, Details: envelope.Error.Details}
++	}
